@@ -26,8 +26,8 @@ heads (a fork) reconciled later by Dolt's existing merge. This makes a dumb
 
 ## What already exists (done, on this branch)
 
-Four new files in `go/store/nbs/` (additive — the single-root path is
-untouched):
+**Step 1 — nbs roots layer.** Four new files in `go/store/nbs/` (additive —
+the single-root path is untouched):
 
 - `multihead_manifest.go` — `multiheadRoots`: an append-only set of
   **content-addressed root records** under `roots/`, each naming its
@@ -38,17 +38,39 @@ untouched):
   `MultiheadRoots()`: record/enumerate heads without touching `Commit`.
 - `multihead_manifest_test.go`, `multihead_store_test.go` — 4 tests.
 
+**Step 2 — datas frontier (a ref becomes a set of tips).** Additive files in
+`go/store/datas/` — the single-root `doCommit`/`BuildNewCommit` path is
+untouched (`TestMultiheadDatasets_SingleRootPathUnaffected` guards it):
+
+- `multihead_datasets.go` — `AppendCommit(ref, v, opts)` builds a commit with
+  **no fast-forward/lineage gate** (it calls `newCommitForValue` directly, the
+  Step-2 relaxation of `ErrMergeNeeded`) and records it as a tip;
+  `RecordTip(ref, addr)` publishes an existing commit as a tip; `Tips(ref)`
+  returns the frontier of that ref's commit DAG; `TipValue` reads a tip's
+  committed value. Tips are **content-addressed sub-keys of the ref in the same
+  root `prolly.AddressMap`** — so a ref holds a *set of tips* with no writer id
+  and no CAS on the ref. (This realizes "a ref becomes a set of tips"
+  *additively*, rather than changing the AddressMap's value type in place —
+  which keeps every existing datas test green. See "A note on the design" below.)
+- `multihead_datasets_test.go` — 6 tests: fork → two tips with no
+  `ErrMergeNeeded` (the anti-CAS proof); fast-forward keeps one tip; a merge
+  collapses the frontier; append/record idempotent; refs isolated; single-root
+  path unaffected.
+- `multihead_conf/main.go` — a small harness exposing the merge-conformance
+  world over JSON, backed by the real datas layer, for the portable gate.
+
 ### Build & test
 ```bash
 cd go
-go build ./store/nbs/
-go vet ./store/nbs/
-go test ./store/nbs/ -run TestMultihead -count=1 -v
-# => ok: ClonedDiskBecomesAFork, PublishIsIdempotent,
-#        MergeCollapsesFrontier, IntegratesWithRealStore
+go build ./store/nbs/ ./store/datas/ ./store/datas/multihead_conf/
+go vet ./store/nbs/ ./store/datas/
+go test ./store/nbs/  -run TestMultihead         -count=1 -v   # Step 1: 4 tests
+go test ./store/datas/ -run TestMultiheadDatasets -count=1 -v   # Step 2: 6 tests
 ```
 First build downloads the module deps (~1.5 GB, ~1–2 min). Go 1.24. The Go
-module root is `go/`.
+module root is `go/`. (The full `./store/nbs/` suite is heavy and can be killed
+by a short CI timeout on its conjoin stress tests — unrelated to these changes;
+use the `-run TestMultihead*` targets for a fast signal.)
 
 ## Invariants you must NOT break
 
@@ -81,21 +103,44 @@ exposes multiple heads.
   `manifest` interface (that interface *is* the single-root assumption), so
   this is a store-construction change, not a manifest swap.
 
-### Step 2 — datas frontier (a ref becomes a set of tips)
-Let a push add a head instead of rejecting a non-fast-forward.
+### Step 2 — datas frontier (a ref becomes a set of tips) — DONE (additive), gate green
+Implemented additively in `multihead_datasets.go` (see "What already exists").
+A ref holds a set of tips via content-addressed sub-keys in the root
+`prolly.AddressMap`; `AppendCommit` bypasses the lineage gate by calling
+`newCommitForValue` directly, so a divergent commit adds a tip instead of
+returning `ErrMergeNeeded`. **Validated against the portable merge-conformance
+suite** (15 pinned CASES + Hypothesis differential, all policies) — see the
+gate section below.
+
+Reference points in the stock single-root path (still intact, for whoever does
+Step 2b — making multi-head the *primary* commit path):
 - `go/store/datas/database_common.go`:
   - `BuildNewCommit` (**:505**) — the lineage gate at **:522**
     (`!hasParentHash(opts, headAddr)` → `ErrMergeNeeded`, defined **:45**;
-    `hasParentHash` is **:966**). Note `opts.Force` already bypasses it, so
-    the gate is optional today.
+    `hasParentHash` is **:966**). `opts.Force` already bypasses it.
   - `doCommit` (**:561**) — the ref-level optimistic CAS at **:567**
     (`if curr != datasetCurrentAddr { return ErrMergeNeeded }`), inside
     `db.update` over a `prolly.AddressMap`.
   - `FastForward` (**:340**), `SetHead` (**:202**) for reference.
-- Change the root value's `prolly.AddressMap` from `datasetID -> commitAddr`
-  to a **set of tips** (or writer-scoped keys), so `doCommit` appends a tip
-  rather than erroring. Resolve-later reuses Dolt's existing three-way merge.
-- **Validate against merge-conformance** (below) before/after.
+
+**A note on the design.** MULTIHEAD.md originally proposed changing the
+AddressMap's *value type* from `commitAddr` to a set. That would ripple through
+every dataset reader (`datasetFromMap`, refspec resolution, SQL, GC) and can't
+be done without regressing the single-root path — violating invariant #4. The
+additive realization (content-addressed sub-keys `<ref>\x00multihead-tip\x00<hash>`
+in the *same* map) gives a ref a set of tips with no value-type change, no
+writer id, and no CAS — and leaves every existing datas test green. Step 2b
+(below) is where the *primary* commit path is switched over.
+
+### Step 2b — make multi-head the primary datas commit path
+`AppendCommit`/`Tips` are additive today (like `PublishHead` in Step 1). To make
+a normal `Commit` publish a tip and expose multiple heads: route `doCommit`
+through `recordTip` (drop the `curr != datasetCurrentAddr` gate) and teach
+`datasetFromMap`/`GetDataset` to surface the frontier (a single `HeadAddr` is
+ambiguous under a fork — return the sole tip or an `ErrMultipleHeads`). Also
+wire **Dolt's real SQL row-merge engine** (`libraries/doltcore/merge`) into the
+resolve path; the conformance harness currently uses a model three-way to
+validate the frontier/resolve plumbing.
 
 ### Step 3 — cross-writer GC
 Stock conjoin/GC deletes shared table files and assumes one root. Make GC a
@@ -108,14 +153,25 @@ the decision note's Quadrable section).
 
 The portable suite that pins fork/edit/merge semantics is
 `experiments/merge-conformance/` (the `mergeconf` Python package) in
-`Taytay/taytays_stuff` (currently on PR #197). A Python spike
-(`experiments/multihead-store/`) already passes it and is the reference for
-the semantics. For Step 2, implement a `mergeconf.MergeDriver` against the
-Dolt multi-head path and run its `CASES` + Hypothesis `check_history`. To use
-it, attach `taytays_stuff` to your session (same owner) or copy the
+`Taytay/taytays_stuff` (currently on PR #197). **Step 2 is wired to it and
+passes:** the `multihead_conf` harness here plus the driver in
+`taytays_stuff/experiments/multihead-dolt-nbs/conformance/` run the real Dolt
+multi-tip datas layer through all 15 pinned CASES and the Hypothesis
+differential check (`fail`/`ours`/`theirs`/`record`).
+
+```bash
+cd go && go build -o /tmp/multihead_conf ./store/datas/multihead_conf
+export MH_CONF_BIN=/tmp/multihead_conf
+export PYTHONPATH=<taytays_stuff>/experiments/merge-conformance
+cd <taytays_stuff>/experiments/multihead-dolt-nbs/conformance && python -m pytest -v
+# => 15 CASES + 1 property test, all green
+```
+
+To use it, attach `taytays_stuff` to your session (same owner) or copy the
 `mergeconf` package in; the ducklake driver in that repo
-(`experiments/ducklake-branch-merge/tests/test_conformance.py`) is a worked
-example of wiring a real store to the suite.
+(`experiments/ducklake-branch-merge/tests/test_conformance.py`) is another
+worked example. Note the harness's resolve step uses a model three-way
+(mirroring `mergeconf/model.py`); Step 2b wires Dolt's real SQL merge engine.
 
 ## Environment notes
 
