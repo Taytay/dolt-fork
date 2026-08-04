@@ -127,19 +127,48 @@ The demo the whole design is for — on a **real on-disk store**, not `TestStora
   `ErrMergeNeeded`); `GetDataset` reports the fork as `ErrMultipleHeads`; a
   reconciler three-way merges the tips with Dolt's real `prolly.MergeMaps` and
   records the merged tip, collapsing the fork to one head.
-- **Concurrency honesty:** stock nbs takes an exclusive manifest lock per open,
-  so the writers *take turns* (open → commit → close) — a synced-folder
-  (Dropbox/S3) model, not simultaneous handles. What is coordination-free is the
-  multi-head *semantics* (a divergent commit adds a head; both survive). Truly
-  concurrent lock-free writers need the "flip the nbs default" follow-on (make
-  `roots/` the only root layer, retiring the single-root manifest + lock).
+- **Concurrency honesty (for the two tests above):** they open the same folder
+  in turn (a synced-folder model). Truly *simultaneous* lock-free writers are the
+  next item.
+
+**Simultaneous, lock-free writers — `roots/` as the coordination point.** The
+follow-on that removes the take-turns caveat, so many writers publish into one
+shared folder at once with no lock and no CAS:
+
+- `go/store/nbs/multihead_folder.go` — `PublishHeadTo(ctx, sharedDir, parents)`
+  publishes a store's committed head into a shared folder by (a) copying its
+  content-addressed table files there (write-once temp+rename, idempotent) and
+  (b) appending a `roots/` record — both lock-free, so concurrent writers never
+  block or get CAS-rejected. `MultiheadFolderFrontier(sharedDir)` LISTs the
+  frontier; `MaterializeFrontierManifest(sharedDir)` compacts the frontier's
+  table specs into one manifest so a plain `NomsBlockStore` opened on the folder
+  reads every head's chunks (the reconcile-read prelude — a single-reconciler
+  step that may take the lock; the *writers* never do).
+- `go/store/nbs/multihead_concurrent_test.go`:
+  - `TestMultihead_ConcurrentWritersNoLock` — N=8 writers, each its own store,
+    all fire off a barrier and `PublishHeadTo` one shared folder **at once**; the
+    frontier is exactly the N heads and every head's chunks read back. Passes
+    under `-race` (10×).
+  - `TestMultihead_StockSingleRootRejectsConcurrentDivergent` — the contrast:
+    two stock stores committing divergently off one base concurrently, and the
+    single-root manifest CAS admits **exactly one**. This is the coordination
+    `roots/` removes.
+- **Why this is the real thing:** the file-manifest store permits concurrent
+  *opens* (it coordinates at `Commit`, not at open); the only contended cell was
+  the root CAS, and `PublishHeadTo` sidesteps it entirely by writing only
+  content-addressed, write-once files. That is the S3/dumb-remote property: no
+  locks, writers never coordinate, divergence is preserved as a frontier and
+  reconciled later. **What still remains:** making this the *default* `Commit`
+  path Dolt-wide (every reader taught to expect a frontier) — the store seam is
+  now here (`PublishHeadTo` + `MultiheadFolderFrontier`).
 
 ### Build & test
 ```bash
 cd go
 go build ./store/nbs/ ./store/datas/ ./store/datas/multihead_conf/
 go vet ./store/nbs/ ./store/datas/
-go test ./store/nbs/  -run TestMultihead                     -count=1 -v  # Step 1 + shared-folder e2e: 5
+go test ./store/nbs/  -run TestMultihead                     -count=1 -v  # Step 1 + e2e + concurrent: 7
+go test ./store/nbs/  -run TestMultihead_ConcurrentWritersNoLock -race -count=10  # lock-free proof
 go test ./store/datas/ -count=1                                           # Steps 2/2b/2c + e2e + full suite (invariant #4)
 go test ./store/datas/ -run 'TestMultiheadDatasets|TestReconcile|TestMultiheadPrimary|TestMultihead_SharedFolder' -count=1 -v  # 15
 # SQL/relational tier (needs libicu-dev for the cgo icu-regex dep):
