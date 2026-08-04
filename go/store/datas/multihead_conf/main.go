@@ -14,17 +14,19 @@
 
 // Command multihead_conf is a thin harness that exposes the merge-conformance
 // world (one keyed table, one main lineage, one branch) over a line-oriented
-// JSON protocol on stdin/stdout, backed by the REAL Dolt multi-tip datas layer
-// (datas.AppendCommit / datas.Tips). A Python mergeconf.MergeDriver drives it
-// as a subprocess so the portable suite (pinned CASES + Hypothesis
-// check_history) runs against actual Dolt commits and the multi-head frontier.
+// JSON protocol on stdin/stdout, backed by the REAL Dolt multi-tip datas layer.
+// A Python mergeconf.MergeDriver drives it as a subprocess so the portable
+// suite (pinned CASES + Hypothesis check_history) runs against actual Dolt
+// commits, the multi-head frontier, and — as of Step 2b — Dolt's real
+// tree-level three-way merge.
 //
-// main and branch are two tips of ONE ref: apply() records a divergent commit
-// as a tip (no CAS, no ErrMergeNeeded); merge() reads the two tips' states and
-// resolves them with a three-way merge that mirrors the conformance model
-// (experiments/merge-conformance/mergeconf/model.py). Storage, fork, tips, and
-// history all go through the real datas layer; the three-way policy logic is
-// the model (wiring Dolt's SQL row-merge engine is a later integration).
+// main and branch are two tips of ONE ref. The table (pk id:int64; value
+// v:string, n:int64 nullable) is stored as a real prolly.Map committed with
+// datas.AppendMapCommit; apply() records a divergent commit as a tip (no CAS,
+// no ErrMergeNeeded); merge() reconciles the two tips with datas.MergeTips,
+// which runs prolly.MergeMaps (the same tree merge Dolt's SQL row merge is
+// built on) over the tips' maps against their common-ancestor commit. The
+// policy is expressed as the merge's CollisionFn.
 //
 // Protocol: one JSON request object per line; one JSON response per line.
 //
@@ -44,9 +46,11 @@ package main
 
 import (
 	"bufio"
+	"bytes"
 	"context"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"sort"
 	"time"
@@ -54,10 +58,21 @@ import (
 	"github.com/dolthub/dolt/go/store/chunks"
 	"github.com/dolthub/dolt/go/store/datas"
 	"github.com/dolthub/dolt/go/store/hash"
-	"github.com/dolthub/dolt/go/store/types"
+	"github.com/dolthub/dolt/go/store/prolly"
+	"github.com/dolthub/dolt/go/store/prolly/tree"
+	"github.com/dolthub/dolt/go/store/val"
 )
 
 const ref = "refs/heads/main"
+
+// The conformance table schema.
+var (
+	keyDesc = val.NewTupleDescriptor(val.Type{Enc: val.Int64Enc})
+	valDesc = val.NewTupleDescriptor(
+		val.Type{Enc: val.StringEnc},
+		val.Type{Enc: val.Int64Enc, Nullable: true},
+	)
+)
 
 // row is a table row value part: (v, n) with n nullable. A missing key in a
 // state means the row is absent.
@@ -66,29 +81,22 @@ type row struct {
 	N *int
 }
 
-func (r row) equal(o row) bool {
-	if r.V != o.V {
-		return false
-	}
-	if (r.N == nil) != (o.N == nil) {
-		return false
-	}
-	return r.N == nil || *r.N == *o.N
-}
-
 type state map[int]row
 
-// wire form: a row is [v, n]; state is {"id": [v, n]}.
 func (s state) toWire() map[string][]interface{} {
 	m := make(map[string][]interface{}, len(s))
 	for k, r := range s {
-		var n interface{}
-		if r.N != nil {
-			n = *r.N
-		}
-		m[fmt.Sprintf("%d", k)] = []interface{}{r.V, n}
+		m[fmt.Sprintf("%d", k)] = rowToWire(r)
 	}
 	return m
+}
+
+func rowToWire(r row) []interface{} {
+	var n interface{}
+	if r.N != nil {
+		n = *r.N
+	}
+	return []interface{}{r.V, n}
 }
 
 func rowFromWire(raw []interface{}) (row, error) {
@@ -127,148 +135,107 @@ func stateFromWire(m map[string][]interface{}) (state, error) {
 	return s, nil
 }
 
-// stateToJSON canonicalizes a state to deterministic bytes (id-sorted triples)
-// so identical states commit to identical values.
-func stateToJSON(s state) []byte {
-	ids := make([]int, 0, len(s))
-	for k := range s {
-		ids = append(ids, k)
-	}
-	sort.Ints(ids)
-	triples := make([][]interface{}, 0, len(ids))
-	for _, id := range ids {
-		r := s[id]
-		var n interface{}
-		if r.N != nil {
-			n = *r.N
-		}
-		triples = append(triples, []interface{}{id, r.V, n})
-	}
-	b, _ := json.Marshal(triples)
-	return b
-}
-
-func stateFromJSON(b []byte) (state, error) {
-	var triples [][]interface{}
-	if err := json.Unmarshal(b, &triples); err != nil {
-		return nil, err
-	}
-	s := make(state, len(triples))
-	for _, tr := range triples {
-		if len(tr) != 3 {
-			return nil, fmt.Errorf("triple must have 3 elements")
-		}
-		id := int(tr[0].(float64))
-		r, err := rowFromWire(tr[1:])
-		if err != nil {
-			return nil, err
-		}
-		s[id] = r
-	}
-	return s, nil
-}
-
-// threeWay mirrors experiments/merge-conformance/mergeconf/model.py exactly.
-// Per key, with base b, ours o, theirs t (absent = missing):
-//   - t == b            -> keep o
-//   - o == b || o == t  -> take t
-//   - otherwise         -> conflict, resolved by policy
-//
-// Returns the merged state and the sorted list of conflicting keys.
-func threeWay(base, ours, theirs state, policy string) (state, []int, map[int]*row) {
-	keys := map[int]struct{}{}
-	for k := range base {
-		keys[k] = struct{}{}
-	}
-	for k := range ours {
-		keys[k] = struct{}{}
-	}
-	for k := range theirs {
-		keys[k] = struct{}{}
-	}
-
-	present := func(s state, k int) (row, bool) { r, ok := s[k]; return r, ok }
-	eq := func(s1 state, k1 int, s2 state, k2 int) bool {
-		r1, ok1 := present(s1, k1)
-		r2, ok2 := present(s2, k2)
-		if ok1 != ok2 {
-			return false
-		}
-		return !ok1 || r1.equal(r2)
-	}
-
-	result := state{}
-	var conflicts []int
-	resolutions := map[int]*row{}
-	for k := range keys {
-		o, oOK := present(ours, k)
-		t, tOK := present(theirs, k)
-
-		var merged row
-		var mergedOK bool
-		switch {
-		case eq(theirs, k, base, k): // theirs unchanged -> keep ours
-			merged, mergedOK = o, oOK
-		case eq(ours, k, base, k) || eq(ours, k, theirs, k): // ours unchanged / convergent -> take theirs
-			merged, mergedOK = t, tOK
-		default: // both changed differently -> conflict
-			conflicts = append(conflicts, k)
-			switch policy {
-			case "theirs":
-				merged, mergedOK = t, tOK
-			default: // ours, record, fail all keep ours
-				merged, mergedOK = o, oOK
-			}
-			if mergedOK {
-				rr := merged
-				resolutions[k] = &rr
-			} else {
-				resolutions[k] = nil
-			}
-		}
-		if mergedOK {
-			result[k] = merged
-		}
-	}
-	sort.Ints(conflicts)
-	return result, conflicts, resolutions
-}
-
 // harness holds the live store and the three tracked heads.
 type harness struct {
 	ctx    context.Context
 	db     datas.Database
+	ns     tree.NodeStore
 	fork   hash.Hash
 	main   hash.Hash
 	branch hash.Hash
 }
 
-func newHarness() *harness {
+func newHarness() (*harness, error) {
 	storage := &chunks.TestStorage{}
-	return &harness{
-		ctx: context.Background(),
-		db:  datas.NewDatabase(storage.NewViewWithDefaultFormat()),
+	db := datas.NewDatabase(storage.NewViewWithDefaultFormat())
+	ns, err := datas.NodeStore(db)
+	if err != nil {
+		return nil, err
 	}
+	return &harness{ctx: context.Background(), db: db, ns: ns}, nil
+}
+
+// mapFromState builds a real prolly.Map (id-sorted) for a table state.
+func (h *harness) mapFromState(s state) (prolly.Map, error) {
+	ids := make([]int, 0, len(s))
+	for k := range s {
+		ids = append(ids, k)
+	}
+	sort.Ints(ids)
+
+	pool := h.ns.Pool()
+	var tups []val.Tuple
+	for _, id := range ids {
+		kb := val.NewTupleBuilder(keyDesc, h.ns)
+		kb.PutInt64(0, int64(id))
+		k, err := kb.Build(h.ctx, pool)
+		if err != nil {
+			return prolly.Map{}, err
+		}
+		vb := val.NewTupleBuilder(valDesc, h.ns)
+		if err := vb.PutString(0, s[id].V); err != nil {
+			return prolly.Map{}, err
+		}
+		if s[id].N != nil {
+			vb.PutInt64(1, int64(*s[id].N))
+		}
+		v, err := vb.Build(h.ctx, pool)
+		if err != nil {
+			return prolly.Map{}, err
+		}
+		tups = append(tups, k, v)
+	}
+	return prolly.NewMapFromTuples(h.ctx, h.ns, keyDesc, valDesc, tups...)
+}
+
+func (h *harness) mapToState(m prolly.Map) (state, error) {
+	it, err := m.IterAll(h.ctx)
+	if err != nil {
+		return nil, err
+	}
+	out := state{}
+	for {
+		k, v, err := it.Next(h.ctx)
+		if err == io.EOF {
+			break
+		}
+		if err != nil {
+			return nil, err
+		}
+		if k == nil {
+			break
+		}
+		id, _ := keyDesc.GetInt64(0, k)
+		vs, _ := valDesc.GetString(0, v)
+		var np *int
+		if n64, ok := valDesc.GetInt64(1, v); ok {
+			n := int(n64)
+			np = &n
+		}
+		out[int(id)] = row{V: vs, N: np}
+	}
+	return out, nil
 }
 
 func (h *harness) commit(s state, parents ...hash.Hash) (hash.Hash, error) {
-	// Pinned dates keep commits deterministic; distinct parents/values still
-	// yield distinct commits, which is what a real fork needs.
+	m, err := h.mapFromState(s)
+	if err != nil {
+		return hash.Hash{}, err
+	}
 	epoch := datas.CommitDateAt(time.UnixMilli(0))
 	meta := &datas.CommitMeta{Author: datas.CommitIdent{Date: epoch}, Committer: datas.CommitIdent{Date: epoch}}
-	return datas.AppendCommit(h.ctx, h.db, ref, types.String(stateToJSON(s)),
-		datas.CommitOptions{Parents: parents, Meta: meta})
+	return datas.AppendMapCommit(h.ctx, h.db, ref, m, datas.CommitOptions{Parents: parents, Meta: meta})
 }
 
 func (h *harness) stateAt(addr hash.Hash) (state, error) {
 	if addr.IsEmpty() {
 		return state{}, nil
 	}
-	v, err := datas.TipValue(h.ctx, h.db, addr)
+	m, err := datas.TipMap(h.ctx, h.db, addr, keyDesc, valDesc)
 	if err != nil {
 		return nil, err
 	}
-	return stateFromJSON([]byte(v.(types.String)))
+	return h.mapToState(m)
 }
 
 func (h *harness) head(side string) (hash.Hash, error) {
@@ -335,58 +302,7 @@ func (h *harness) handle(req request) (map[string]interface{}, error) {
 		return map[string]interface{}{"ok": true}, nil
 
 	case "merge":
-		base, err := h.stateAt(h.fork)
-		if err != nil {
-			return nil, err
-		}
-		ours, err := h.stateAt(h.main)
-		if err != nil {
-			return nil, err
-		}
-		theirs, err := h.stateAt(h.branch)
-		if err != nil {
-			return nil, err
-		}
-		merged, conflicts, resolutions := threeWay(base, ours, theirs, req.Policy)
-
-		// policy "fail" with any conflict refuses the whole merge and touches
-		// nothing (all-or-nothing).
-		if req.Policy == "fail" && len(conflicts) > 0 {
-			return map[string]interface{}{
-				"ok":              true,
-				"applied":         false,
-				"conflicts":       conflicts,
-				"conflicts_known": true,
-			}, nil
-		}
-
-		// Append the merge as a new tip naming both heads; this collapses the
-		// frontier (verified separately by Tips in the Go unit tests).
-		mergeAddr, err := h.commit(merged, h.main, h.branch)
-		if err != nil {
-			return nil, err
-		}
-		h.main = mergeAddr
-
-		res := map[string]interface{}{}
-		for k, r := range resolutions {
-			if r == nil {
-				res[fmt.Sprintf("%d", k)] = nil
-			} else {
-				var n interface{}
-				if r.N != nil {
-					n = *r.N
-				}
-				res[fmt.Sprintf("%d", k)] = []interface{}{r.V, n}
-			}
-		}
-		return map[string]interface{}{
-			"ok":              true,
-			"applied":         true,
-			"conflicts":       conflicts,
-			"conflicts_known": true,
-			"resolutions":     res,
-		}, nil
+		return h.merge(req.Policy)
 
 	case "state":
 		headAddr, err := h.head(req.Side)
@@ -420,6 +336,74 @@ func (h *harness) handle(req request) (map[string]interface{}, error) {
 	default:
 		return nil, fmt.Errorf("unknown cmd %q", req.Cmd)
 	}
+}
+
+func (h *harness) merge(policy string) (map[string]interface{}, error) {
+	// Identical heads (both sides no-op, or convergent to the same commit):
+	// nothing to reconcile, main already holds the answer.
+	if h.main == h.branch {
+		return map[string]interface{}{
+			"ok": true, "applied": true, "conflicts_known": true,
+			"conflicts": []int{}, "resolutions": map[string]interface{}{},
+		}, nil
+	}
+
+	var conflicts []int
+	collide := func(l, r tree.Diff) (tree.Diff, bool) {
+		if l.Type == r.Type && bytes.Equal(l.To, r.To) {
+			return l, true // convergent edit: not a conflict
+		}
+		id, _ := keyDesc.GetInt64(0, val.Tuple(l.Key))
+		conflicts = append(conflicts, int(id))
+		if policy == "theirs" {
+			return r, true
+		}
+		return l, true // ours / record / fail keep ours
+	}
+
+	merged, err := datas.MergeTips(h.ctx, h.db, h.main, h.branch, keyDesc, valDesc, collide)
+	if err != nil {
+		return nil, err
+	}
+	sort.Ints(conflicts)
+
+	// policy "fail" refuses the whole merge on any conflict (all-or-nothing):
+	// leave main untouched, do not commit.
+	if policy == "fail" && len(conflicts) > 0 {
+		return map[string]interface{}{
+			"ok": true, "applied": false, "conflicts_known": true, "conflicts": conflicts,
+		}, nil
+	}
+
+	mergeAddr, err := h.commit2(merged, h.main, h.branch)
+	if err != nil {
+		return nil, err
+	}
+	h.main = mergeAddr
+
+	mergedState, err := h.mapToState(merged)
+	if err != nil {
+		return nil, err
+	}
+	res := map[string]interface{}{}
+	for _, id := range conflicts {
+		if r, ok := mergedState[id]; ok {
+			res[fmt.Sprintf("%d", id)] = rowToWire(r)
+		} else {
+			res[fmt.Sprintf("%d", id)] = nil
+		}
+	}
+	return map[string]interface{}{
+		"ok": true, "applied": true, "conflicts_known": true,
+		"conflicts": conflicts, "resolutions": res,
+	}, nil
+}
+
+// commit2 commits an already-merged prolly.Map as the collapsing tip.
+func (h *harness) commit2(m prolly.Map, parents ...hash.Hash) (hash.Hash, error) {
+	epoch := datas.CommitDateAt(time.UnixMilli(0))
+	meta := &datas.CommitMeta{Author: datas.CommitIdent{Date: epoch}, Committer: datas.CommitIdent{Date: epoch}}
+	return datas.AppendMapCommit(h.ctx, h.db, ref, m, datas.CommitOptions{Parents: parents, Meta: meta})
 }
 
 func applyOps(s state, ops [][]interface{}) (state, error) {
@@ -459,7 +443,11 @@ func applyOps(s state, ops [][]interface{}) (state, error) {
 }
 
 func main() {
-	h := newHarness()
+	h, err := newHarness()
+	if err != nil {
+		fmt.Fprintln(os.Stderr, err)
+		os.Exit(1)
+	}
 	in := bufio.NewScanner(os.Stdin)
 	in.Buffer(make([]byte, 0, 1024*1024), 1024*1024)
 	out := bufio.NewWriter(os.Stdout)

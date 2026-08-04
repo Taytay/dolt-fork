@@ -59,13 +59,31 @@ untouched (`TestMultiheadDatasets_SingleRootPathUnaffected` guards it):
 - `multihead_conf/main.go` — a small harness exposing the merge-conformance
   world over JSON, backed by the real datas layer, for the portable gate.
 
+**Step 2b — reconcile a fork with Dolt's *real* three-way merge.** Additive
+files in `go/store/datas/`:
+
+- `multihead_merge.go` — `AppendMapCommit`/`TipMap` store & load a table as a
+  real `prolly.Map` tip (committed value = the map's root node, so its chunks
+  are referenced), and `MergeTips(ours, theirs, kd, vd, collide)` reconciles a
+  two-tip fork with **`prolly.MergeMaps`** — the same tree-level three-way merge
+  Dolt's SQL row merge is built on — using `FindCommonAncestor` for the base.
+  The merge policy is the caller's `tree.CollisionFn`. `NodeStore(db)` exposes
+  the store for building maps.
+- `multihead_merge_test.go` — 4 tests: disjoint clean auto-merge, update/update
+  under each policy, update-vs-delete, and a no-common-ancestor (empty base)
+  merge — over real prolly maps, asserting merged contents + frontier collapse.
+- `multihead_conf/main.go` now stores the table as a real `prolly.Map` and
+  resolves merges via `MergeTips` (Dolt's real merge), replacing the model
+  three-way. The portable `mergeconf` suite (15 CASES + Hypothesis differential,
+  all policies) passes against it.
+
 ### Build & test
 ```bash
 cd go
 go build ./store/nbs/ ./store/datas/ ./store/datas/multihead_conf/
 go vet ./store/nbs/ ./store/datas/
-go test ./store/nbs/  -run TestMultihead         -count=1 -v   # Step 1: 4 tests
-go test ./store/datas/ -run TestMultiheadDatasets -count=1 -v   # Step 2: 6 tests
+go test ./store/nbs/  -run TestMultihead                     -count=1 -v  # Step 1: 4
+go test ./store/datas/ -run 'TestMultiheadDatasets|TestReconcile' -count=1 -v  # Step 2/2b: 10
 ```
 First build downloads the module deps (~1.5 GB, ~1–2 min). Go 1.24. The Go
 module root is `go/`. (The full `./store/nbs/` suite is heavy and can be killed
@@ -132,15 +150,31 @@ in the *same* map) gives a ref a set of tips with no value-type change, no
 writer id, and no CAS — and leaves every existing datas test green. Step 2b
 (below) is where the *primary* commit path is switched over.
 
-### Step 2b — make multi-head the primary datas commit path
-`AppendCommit`/`Tips` are additive today (like `PublishHead` in Step 1). To make
-a normal `Commit` publish a tip and expose multiple heads: route `doCommit`
-through `recordTip` (drop the `curr != datasetCurrentAddr` gate) and teach
-`datasetFromMap`/`GetDataset` to surface the frontier (a single `HeadAddr` is
-ambiguous under a fork — return the sole tip or an `ErrMultipleHeads`). Also
-wire **Dolt's real SQL row-merge engine** (`libraries/doltcore/merge`) into the
-resolve path; the conformance harness currently uses a model three-way to
-validate the frontier/resolve plumbing.
+### Step 2b — reconcile with Dolt's real three-way merge — DONE (tree-level), gate green
+Implemented in `multihead_merge.go` (see "What already exists"). A fork is
+collapsed by `MergeTips`, which runs **`prolly.MergeMaps`** — Dolt's real
+tree-level three-way merge, the same one the SQL row merge is built on — over
+the tips' committed prolly maps against their `FindCommonAncestor` base. The
+conformance harness now stores real prolly maps and resolves via `MergeTips`,
+so the portable suite validates against Dolt's actual merge, not a model. This
+retires the "model three-way" caveat for the row/tuple merge.
+
+**What still remains for full relational fidelity** (`libraries/doltcore/merge`,
+one layer up from `store/`): schema merge, multiple tables, secondary
+indexes, FK/constraint validation, and Dolt's conflict-recording tables.
+`prolly.MergeMaps` merges one keyed map; `doltcore/merge` composes that across a
+whole `RootValue`. Wiring it needs the doltdb/SQL stack (a heavier dependency
+than `store/`), so it is its own step.
+
+### Step 2c — make multi-head the primary commit path
+Everything so far is **additive** (`AppendCommit`/`AppendMapCommit`/`MergeTips`
+alongside the untouched `doCommit`). To make a normal `Commit` publish a tip and
+expose multiple heads by default: route `doCommit` through `recordTip` (drop the
+`curr != datasetCurrentAddr` gate) and teach `datasetFromMap`/`GetDataset` to
+surface the frontier (a single `HeadAddr` is ambiguous under a fork — return the
+sole tip or an `ErrMultipleHeads`), plus the nbs half in Step 1. This flips a
+Dolt-wide default (every dataset reader, refspec resolution, SQL, GC), so it is
+a large, high-regression change best done on its own with the full suite green.
 
 ### Step 3 — cross-writer GC
 Stock conjoin/GC deletes shared table files and assumes one root. Make GC a
@@ -153,11 +187,12 @@ the decision note's Quadrable section).
 
 The portable suite that pins fork/edit/merge semantics is
 `experiments/merge-conformance/` (the `mergeconf` Python package) in
-`Taytay/taytays_stuff` (currently on PR #197). **Step 2 is wired to it and
-passes:** the `multihead_conf` harness here plus the driver in
+`Taytay/taytays_stuff` (currently on PR #197). **Steps 2 and 2b are wired to it
+and pass:** the `multihead_conf` harness here plus the driver in
 `taytays_stuff/experiments/multihead-dolt-nbs/conformance/` run the real Dolt
-multi-tip datas layer through all 15 pinned CASES and the Hypothesis
-differential check (`fail`/`ours`/`theirs`/`record`).
+multi-tip datas layer — storing real `prolly.Map`s and reconciling forks with
+`prolly.MergeMaps` (Dolt's real merge) — through all 15 pinned CASES and the
+Hypothesis differential check (`fail`/`ours`/`theirs`/`record`).
 
 ```bash
 cd go && go build -o /tmp/multihead_conf ./store/datas/multihead_conf
@@ -170,8 +205,10 @@ cd <taytays_stuff>/experiments/multihead-dolt-nbs/conformance && python -m pytes
 To use it, attach `taytays_stuff` to your session (same owner) or copy the
 `mergeconf` package in; the ducklake driver in that repo
 (`experiments/ducklake-branch-merge/tests/test_conformance.py`) is another
-worked example. Note the harness's resolve step uses a model three-way
-(mirroring `mergeconf/model.py`); Step 2b wires Dolt's real SQL merge engine.
+worked example. The harness's resolve step now uses Dolt's real tree-level
+merge (`prolly.MergeMaps`); the full SQL merge engine (`libraries/doltcore/merge`
+— schema/multi-table/constraints) is the remaining integration (Step 2b's
+"what still remains").
 
 ## Environment notes
 
