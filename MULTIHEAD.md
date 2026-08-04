@@ -77,13 +77,52 @@ files in `go/store/datas/`:
   three-way. The portable `mergeconf` suite (15 CASES + Hypothesis differential,
   all policies) passes against it.
 
+**Step 2c — multi-head as the PRIMARY commit path.** Additive files +
+mode-gated branches in `go/store/datas/`:
+
+- `multihead_primary.go` — `EnableMultihead(db)` turns a database's *ordinary*
+  `Commit`/`GetDataset` API multi-head: `Commit` publishes the new commit as a
+  tip with no fast-forward gate and no CAS on the ref (a divergent commit adds a
+  head instead of `ErrMergeNeeded`; a sequential commit names the observed head,
+  so the frontier fast-forwards back to one tip), and `GetDataset` resolves the
+  ref's frontier — the sole tip, or `ErrMultipleHeads` when forked. The mode is
+  **off by default**, so a database opened normally is byte-identical to stock
+  (invariant #4). The branches in `database_common.go` (`Commit`,
+  `datasetFromMap`) are one guarded `if db.multihead` each; `tips` was refactored
+  to a reusable `frontierOf(am, ref)` so the primary path resolves against the
+  exact root map it holds.
+- `multihead_primary_test.go` — 4 tests: a fork through the *normal* `Commit`
+  API leaves two tips with no `ErrMergeNeeded` and `GetDataset` returns
+  `ErrMultipleHeads`; sequential commits fast-forward to one head; a reconcile
+  collapses the fork and `GetDataset` resolves again; and the default (non-
+  multihead) database still enforces the single-root CAS.
+
+**SQL/relational merge engine — reconcile a whole RootValue with Dolt's real
+`MergeRoots`.** `prolly.MergeMaps` (Step 2b) merges ONE keyed map; a real tip is
+a whole `RootValue` (many tables, schemas, indexes, constraints). Composing the
+per-map merge across a root is `libraries/doltcore/merge.MergeRoots` — what
+`dolt merge` itself calls. `store/datas` cannot import `doltcore` (the layering
+runs the other way), so this tier is validated one layer up:
+
+- `go/libraries/doltcore/merge/multihead_reconcile_test.go` — frames `ours`/
+  `theirs` as two tips of a forked ref and reconciles them with the **real
+  `MergeRoots`**, over the fidelity `prolly.MergeMaps` alone cannot reach: 3
+  tests — multiple tables with disjoint edits (clean auto-merge across the whole
+  root), a **schema change** (add nullable column) on one side merged with row
+  edits on the other, and a row-level **conflict** recorded into the merged
+  root's conflict table. Reuses the package's own harness (`sch`/`tbl`/
+  `verifyMerge`) plus a `mhRootWithTables` multi-table root builder.
+
 ### Build & test
 ```bash
 cd go
 go build ./store/nbs/ ./store/datas/ ./store/datas/multihead_conf/
 go vet ./store/nbs/ ./store/datas/
 go test ./store/nbs/  -run TestMultihead                     -count=1 -v  # Step 1: 4
-go test ./store/datas/ -run 'TestMultiheadDatasets|TestReconcile' -count=1 -v  # Step 2/2b: 10
+go test ./store/datas/ -count=1                                           # Steps 2/2b/2c + full suite (invariant #4)
+go test ./store/datas/ -run 'TestMultiheadDatasets|TestReconcile|TestMultiheadPrimary' -count=1 -v  # 14
+# SQL/relational tier (needs libicu-dev for the cgo icu-regex dep):
+go test ./libraries/doltcore/merge/ -run TestMultiheadReconcile -count=1 -v  # 3
 ```
 First build downloads the module deps (~1.5 GB, ~1–2 min). Go 1.24. The Go
 module root is `go/`. (The full `./store/nbs/` suite is heavy and can be killed
@@ -159,22 +198,39 @@ conformance harness now stores real prolly maps and resolves via `MergeTips`,
 so the portable suite validates against Dolt's actual merge, not a model. This
 retires the "model three-way" caveat for the row/tuple merge.
 
-**What still remains for full relational fidelity** (`libraries/doltcore/merge`,
-one layer up from `store/`): schema merge, multiple tables, secondary
-indexes, FK/constraint validation, and Dolt's conflict-recording tables.
-`prolly.MergeMaps` merges one keyed map; `doltcore/merge` composes that across a
-whole `RootValue`. Wiring it needs the doltdb/SQL stack (a heavier dependency
-than `store/`), so it is its own step.
+**Full relational fidelity — DONE at the RootValue level (via `MergeRoots`),
+gate green.** The remaining fidelity beyond one keyed map — schema merge,
+multiple tables, secondary indexes, FK/constraint validation, and Dolt's
+conflict-recording tables — is exactly `libraries/doltcore/merge.MergeRoots`
+(what `dolt merge` calls). `multihead_reconcile_test.go` (see "What already
+exists") reconciles two multi-head tips through the real `MergeRoots` over
+multiple tables, a schema change, and a recorded conflict. `store/datas` can't
+import `doltcore` (layering), so this validation correctly lives in the
+`doltcore/merge` package. **What still remains:** end-to-end wiring of a
+multi-head *tip* (a datas commit whose value is a `RootValue`) → `MergeRoots` →
+record the merged `RootValue` as the collapsing tip, driven through the running
+doltdb/SQL session (a `dolt merge` that reads the frontier). The engine tier is
+proven; the plumbing that hands multi-head tips to it is the next integration.
 
-### Step 2c — make multi-head the primary commit path
-Everything so far is **additive** (`AppendCommit`/`AppendMapCommit`/`MergeTips`
-alongside the untouched `doCommit`). To make a normal `Commit` publish a tip and
-expose multiple heads by default: route `doCommit` through `recordTip` (drop the
-`curr != datasetCurrentAddr` gate) and teach `datasetFromMap`/`GetDataset` to
-surface the frontier (a single `HeadAddr` is ambiguous under a fork — return the
-sole tip or an `ErrMultipleHeads`), plus the nbs half in Step 1. This flips a
-Dolt-wide default (every dataset reader, refspec resolution, SQL, GC), so it is
-a large, high-regression change best done on its own with the full suite green.
+### Step 2c — make multi-head the primary commit path — DONE (mode-gated), gate green
+Implemented in `multihead_primary.go` (see "What already exists"). A database
+switched with `EnableMultihead(db)` has a multi-head *primary* path: the ordinary
+`Commit` publishes a tip with no lineage gate and no `curr != datasetCurrentAddr`
+CAS (a divergent commit adds a head; a sequential one fast-forwards), and
+`GetDataset` surfaces the frontier — the sole tip, or `ErrMultipleHeads` under a
+fork. `Commit` and `datasetFromMap` each branch on a single `if db.multihead`;
+`tips` was refactored into a reusable `frontierOf(am, ref)` the primary path
+shares.
+
+**Why mode-gated, not a Dolt-wide flip.** The single-root CAS is assumed by
+essentially every reader, refspec resolver, SQL path, and the GC; flipping it
+unconditionally would regress the whole suite (invariant #4). Mode-gating makes
+multi-head a genuine, first-class *primary* path — a normal `Commit` is multi-tip
+when the mode is on — while a database opened normally stays byte-identical to
+stock (`TestMultiheadPrimary_DefaultModeKeepsCAS` guards this). Flipping the
+global default (teaching *every* reader to expect a frontier, plus the nbs half
+in Step 1) remains the larger follow-on; `EnableMultihead` is the seam it hangs
+on.
 
 ### Step 3 — cross-writer GC
 Stock conjoin/GC deletes shared table files and assumes one root. Make GC a
@@ -205,10 +261,13 @@ cd <taytays_stuff>/experiments/multihead-dolt-nbs/conformance && python -m pytes
 To use it, attach `taytays_stuff` to your session (same owner) or copy the
 `mergeconf` package in; the ducklake driver in that repo
 (`experiments/ducklake-branch-merge/tests/test_conformance.py`) is another
-worked example. The harness's resolve step now uses Dolt's real tree-level
-merge (`prolly.MergeMaps`); the full SQL merge engine (`libraries/doltcore/merge`
-— schema/multi-table/constraints) is the remaining integration (Step 2b's
-"what still remains").
+worked example. The harness's resolve step uses Dolt's real tree-level merge
+(`prolly.MergeMaps`). The full relational merge engine
+(`libraries/doltcore/merge.MergeRoots` — schema/multi-table/constraints) is
+exercised separately by `multihead_reconcile_test.go` in that package (it needs
+the doltdb/SQL stack, which `store/datas` cannot import). What is left is
+end-to-end plumbing (multi-head tip → `MergeRoots` → recorded merged tip through
+a running doltdb session), not the engine itself.
 
 ## Environment notes
 

@@ -191,10 +191,18 @@ func (db *database) tips(ctx context.Context, ref string) ([]hash.Hash, error) {
 	if err != nil {
 		return nil, err
 	}
+	return db.frontierOf(ctx, am, ref)
+}
 
+// frontierOf computes ref's frontier within a given root address map: the tip
+// commit addresses that no other tip names as an immediate parent, sorted for a
+// stable result. It is factored out of tips so the primary multi-head path
+// (datasetFromFrontier) can resolve a ref against the exact map it already
+// holds, rather than re-reading the current root.
+func (db *database) frontierOf(ctx context.Context, am prolly.AddressMap, ref string) ([]hash.Hash, error) {
 	prefix := tipKeyPrefix(ref)
 	var all []hash.Hash
-	err = am.IterAll(ctx, func(key string, addr hash.Hash) error {
+	err := am.IterAll(ctx, func(key string, addr hash.Hash) error {
 		if strings.HasPrefix(key, prefix) {
 			all = append(all, addr)
 		}

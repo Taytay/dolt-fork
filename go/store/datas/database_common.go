@@ -38,6 +38,15 @@ type database struct {
 	*types.ValueStore
 	rt rootTracker
 	ns tree.NodeStore
+	// multihead, when set, makes this database's PRIMARY commit path
+	// multi-head: Commit publishes a tip with no fast-forward gate and no CAS
+	// on the ref (a divergent commit adds a head instead of ErrMergeNeeded),
+	// and GetDataset resolves the ref's frontier (the sole tip, or
+	// ErrMultipleHeads when forked). It defaults to false so the single-root
+	// path is byte-identical to stock until a database is deliberately opened
+	// in multi-head mode (MULTIHEAD.md Step 2c; invariant #4). See
+	// multihead_primary.go.
+	multihead bool
 }
 
 var (
@@ -45,6 +54,11 @@ var (
 	ErrMergeNeeded          = errors.New("dataset head is not ancestor of commit")
 	ErrAlreadyCommitted     = errors.New("dataset head already pointing at given commit")
 	ErrDirtyWorkspace       = errors.New("target has uncommitted changes. --force required to overwrite")
+	// ErrMultipleHeads is returned by the multi-head primary path when a ref
+	// has a live fork (more than one tip) and a caller asks for its single
+	// head. Reconcile the tips (see MergeTips) and record the result to
+	// collapse the frontier. Defined here beside the other datas sentinels.
+	ErrMultipleHeads = errors.New("dataset has multiple heads; reconcile the fork")
 )
 
 // rootTracker is a narrowing of the ChunkStore interface, to keep Database disciplined about working directly with Chunks
@@ -168,6 +182,11 @@ func (db *database) DatasetsByRootHash(ctx context.Context, rootHash hash.Hash) 
 }
 
 func (db *database) datasetFromMap(ctx context.Context, datasetID string, dsmap DatasetsMap) (Dataset, error) {
+	if db.multihead {
+		// Primary multi-head path: resolve the ref's frontier. A single tip is
+		// the head; a fork returns ErrMultipleHeads. See multihead_primary.go.
+		return db.datasetFromFrontier(ctx, datasetID, dsmap)
+	}
 	if rmdsmap, ok := dsmap.(refmapDatasetsMap); ok {
 		var err error
 		curr, err := rmdsmap.am.Get(ctx, datasetID)
@@ -528,6 +547,11 @@ func (db *database) BuildNewCommit(ctx context.Context, ds Dataset, v types.Valu
 }
 
 func (db *database) Commit(ctx context.Context, ds Dataset, v types.Value, opts CommitOptions) (Dataset, error) {
+	if db.multihead {
+		// Primary multi-head path: no lineage gate, no ref CAS — a divergent
+		// commit adds a tip. See commitMultihead in multihead_primary.go.
+		return db.commitMultihead(ctx, ds, v, opts)
+	}
 	commit, err := db.BuildNewCommit(ctx, ds, v, opts)
 	if err != nil {
 		return Dataset{}, err
