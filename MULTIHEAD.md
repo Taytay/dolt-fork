@@ -113,14 +113,35 @@ runs the other way), so this tier is validated one layer up:
   root's conflict table. Reuses the package's own harness (`sch`/`tbl`/
   `verifyMerge`) plus a `mhRootWithTables` multi-table root builder.
 
+**End-to-end: one shared folder, two writers, a head each, reconcile later.**
+The demo the whole design is for — on a **real on-disk store**, not `TestStorage`:
+
+- `go/store/nbs/multihead_e2e_test.go` — `TestMultihead_SharedFolderTwoWritersOneHeadEach`:
+  one folder is the shared store; two writers each derive from a common base and
+  `PublishHead` into the append-only, content-addressed `roots/` set over shared
+  table files; the folder ends with **two heads discovered by LISTing `roots/`**,
+  and both heads' chunks read back from the one shared store (nothing clobbered).
+- `go/store/datas/multihead_e2e_test.go` — `TestMultihead_SharedFolderReconcileEndToEnd`:
+  the relational end-to-end. Two writers commit divergently through the
+  **primary multi-head `Commit`** API on a real shared folder (no
+  `ErrMergeNeeded`); `GetDataset` reports the fork as `ErrMultipleHeads`; a
+  reconciler three-way merges the tips with Dolt's real `prolly.MergeMaps` and
+  records the merged tip, collapsing the fork to one head.
+- **Concurrency honesty:** stock nbs takes an exclusive manifest lock per open,
+  so the writers *take turns* (open → commit → close) — a synced-folder
+  (Dropbox/S3) model, not simultaneous handles. What is coordination-free is the
+  multi-head *semantics* (a divergent commit adds a head; both survive). Truly
+  concurrent lock-free writers need the "flip the nbs default" follow-on (make
+  `roots/` the only root layer, retiring the single-root manifest + lock).
+
 ### Build & test
 ```bash
 cd go
 go build ./store/nbs/ ./store/datas/ ./store/datas/multihead_conf/
 go vet ./store/nbs/ ./store/datas/
-go test ./store/nbs/  -run TestMultihead                     -count=1 -v  # Step 1: 4
-go test ./store/datas/ -count=1                                           # Steps 2/2b/2c + full suite (invariant #4)
-go test ./store/datas/ -run 'TestMultiheadDatasets|TestReconcile|TestMultiheadPrimary' -count=1 -v  # 14
+go test ./store/nbs/  -run TestMultihead                     -count=1 -v  # Step 1 + shared-folder e2e: 5
+go test ./store/datas/ -count=1                                           # Steps 2/2b/2c + e2e + full suite (invariant #4)
+go test ./store/datas/ -run 'TestMultiheadDatasets|TestReconcile|TestMultiheadPrimary|TestMultihead_SharedFolder' -count=1 -v  # 15
 # SQL/relational tier (needs libicu-dev for the cgo icu-regex dep):
 go test ./libraries/doltcore/merge/ -run TestMultiheadReconcile -count=1 -v  # 3
 ```
