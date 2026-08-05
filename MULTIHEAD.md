@@ -321,18 +321,73 @@ enumerates:
   end-to-end: `dolt gc` on a still-forked tracking ref leaves both tips, and the
   fork still reconciles cleanly afterward.
 
-**Known limits (the honest edges).** Push/fetch, reconcile, and GC are all
+**No-manifest-overwrite push — the relational `roots/` bridge (for lazy-synced
+folders).** The goal: a multi-head push must not rely on overwriting a single
+mutable `manifest` file, so a Dropbox/Drive-style lazily-synced folder (which
+conflict-copies or clobbers a concurrently-edited file) is a safe remote.
+
+*Audit (where an overwrite happens today).* Multi-head push does NOT yet meet
+that bar. The chain is `pushMultihead → DoltDB.RecordTip → datas.RecordTip →
+db.update → db.tryCommitChunks(newRoot, oldRoot) → nbs manifest optimistic CAS`:
+every recorded tip rewrites the remote's one `manifest` file. That is the mutable
+cell lazy sync breaks on.
+
+*The two-layer mismatch.* There are two independent multi-head designs at
+different granularities, and they were never joined: the **datas frontier**
+(tips-per-ref *inside* one AddressMap, one Noms root, advanced by **manifest
+CAS** — what push/fetch/reconcile use) and the **nbs `roots/`** layer
+(whole-store roots as **append-only**, content-addressed records — lock-free, no
+manifest, built + `-race` tested but unwired). Push uses the first; the second is
+what lazy sync needs.
+
+*What is now built and tested — the bridge.* The relational frontier now rides
+the append-only `roots/` layer:
+- `nbs.MultiheadFolderRootHashes` (`store/nbs/multihead_folder.go`) exposes each
+  frontier record's whole-store root hash.
+- `datas.RefFrontierAcrossRoots` (`store/datas/multihead_datasets.go`) unions a
+  ref's tips across several such roots and drops any tip another names as a
+  parent — the read side of relational multi-head over `roots/`, the counterpart
+  of a manifest-CAS `RecordTip`.
+- `store/datas/multihead_folder_bridge_test.go`
+  (`TestMultihead_FolderBridgeNoManifestOverwrite`) proves the shape end-to-end
+  on a real on-disk store modelling a dumb folder: two independent writers
+  (separate stores seeded from a common base) each commit a divergent relational
+  tip and `PublishHeadTo` the shared folder — content-addressed table files plus
+  a write-once `roots/` record, **no manifest written** (the test asserts
+  `shared/manifest` does not exist and that `roots/` holds the records). A reader
+  unions the per-ref frontier across the roots, three-way merges it with Dolt's
+  real engine, and a merged deposit collapses the frontier to one head.
+
+*What still remains before `dolt push file://<synced-folder>` is lock-free
+end-to-end* (the honest, sequenced next steps):
+1. **Chunk-closure → table-file persister, not a copy.** `PublishHeadTo` copies
+   *existing* table files, but a local repo journals its chunks
+   (`doltdb.go` sets `ChunkJournalParam`), so journaled chunks aren't loose table
+   files to copy. Push must write the pushed commit's chunk closure into the
+   shared folder as a content-addressed table file directly.
+2. **Generational reach.** A `file://` remote is a `GenerationalNBS` (newGen =
+   classic `LocalStore`, oldGen under `oldgen/`); the deposit path must target
+   the right generation rather than assume a bare `*NomsBlockStore`.
+3. **Lazy-sync-safe read materialization.** Fetch currently would call
+   `MaterializeFrontierManifest`, which writes a `manifest` into the shared
+   folder; on a synced folder a reader should materialize into a local scratch
+   instead so no shared file is written on read either.
+4. **Wire it under `pushMultihead`/`fetchRefSpecsMultihead`** for `file://`
+   folder remotes, folded into `DOLT_MULTIHEAD` (the chosen toggle).
+
+**Other known limits (the honest edges).** Push/fetch, reconcile, and GC are all
 frontier-aware, so the full round trip — two `dolt` CLIs fork a folder remote,
 `dolt reconcile` collapses the fork to one merged head, `dolt gc` keeps a live
-fork intact — works from the CLI. What is still NOT wired: `dolt merge <branch>`
-/ `dolt pull` themselves keep the stock single-root path (reconcile is its own
+fork intact — works from the CLI on a local/NFS remote. `dolt merge <branch>` /
+`dolt pull` themselves keep the stock single-root path (reconcile is its own
 `dolt reconcile` verb / `dolt_reconcile()` procedure, deliberately not entangled
 with the heavily-used merge path); `dolt_reconcile` folds >2 tips against the
 canonical tip's ancestor (octopus-style approximation — a true two-writer fork is
-exact); tags are single-headed on the wire. Truly *simultaneous* pushes to one
-folder serialize at the remote's nbs root-map (both survive as tips, none
-rejected); the fully lock-free deposit is the `store/nbs` `roots/` path
-(`PublishHeadTo`), not yet wired under push. The toggle remains experimental.
+exact); tags are single-headed on the wire. Truly *simultaneous* pushes to a
+local/NFS folder serialize at the remote's nbs manifest CAS (both survive as
+tips, none rejected); the fully lock-free, no-manifest deposit is the `roots/`
+bridge above — proven at the store/datas tier, with the CLI wiring sequenced in
+the four steps above. The toggle remains experimental.
 
 ### Build & test
 ```bash
@@ -343,6 +398,7 @@ go test ./store/nbs/  -run TestMultihead                     -count=1 -v  # Step
 go test ./store/nbs/  -run TestMultihead_ConcurrentWritersNoLock -race -count=10  # lock-free proof
 go test ./store/datas/ -count=1                                           # Steps 2/2b/2c + e2e + full suite (invariant #4)
 go test ./store/datas/ -run 'TestMultiheadDatasets|TestReconcile|TestMultiheadPrimary|TestMultihead_SharedFolder' -count=1 -v  # 15
+go test ./store/datas/ -run TestMultihead_FolderBridgeNoManifestOverwrite -count=1 -v  # relational roots/ bridge: publish + read a fork with NO manifest overwrite
 # SQL/relational tier (needs libicu-dev for the cgo icu-regex dep):
 go test ./libraries/doltcore/merge/ -run TestMultiheadReconcile -count=1 -v  # 3
 # Multi-head fetch/push (needs libicu-dev):

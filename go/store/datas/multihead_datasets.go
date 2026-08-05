@@ -195,6 +195,78 @@ func AllFrontierTips(ctx context.Context, db Database) (map[string][]hash.Hash, 
 	return out, nil
 }
 
+// RefFrontierAcrossRoots computes a ref's frontier across SEVERAL whole-store
+// roots — the read side of relational multi-head over the append-only nbs
+// `roots/` layer. Where Tips reads the ref's tips from the one current root
+// address map, this unions the ref's tips from every root in |roots| (each the
+// Noms root of a `roots/` frontier record, via nbs.MultiheadFolderRootHashes)
+// and then drops any tip another names as an immediate parent, so a fork
+// published by independent writers into a shared folder collapses to its true
+// frontier.
+//
+// It is the counterpart of a manifest-CAS RecordTip for the lazy-sync path: a
+// writer deposits its whole root as an append-only `roots/` record (no manifest
+// overwrite), and a reader reconstructs the per-ref frontier here without any
+// writer ever having contended on a single mutable head. The store must be able
+// to read the chunks of every root (e.g. after nbs.MaterializeFrontierManifest
+// has unioned the frontier's table specs).
+func RefFrontierAcrossRoots(ctx context.Context, db Database, refStr string, roots []hash.Hash) ([]hash.Hash, error) {
+	d, err := asDatabase(db)
+	if err != nil {
+		return nil, err
+	}
+	prefix := tipKeyPrefix(refStr)
+
+	// Gather the union of the ref's tip addresses across every root.
+	seen := make(map[hash.Hash]struct{})
+	var all []hash.Hash
+	for _, root := range roots {
+		am, err := d.loadDatasetsRefmap(ctx, root)
+		if err != nil {
+			return nil, err
+		}
+		err = am.IterAll(ctx, func(key string, addr hash.Hash) error {
+			if strings.HasPrefix(key, prefix) {
+				if _, ok := seen[addr]; !ok {
+					seen[addr] = struct{}{}
+					all = append(all, addr)
+				}
+			}
+			return nil
+		})
+		if err != nil {
+			return nil, err
+		}
+	}
+
+	// A tip is superseded iff some tip names it as an immediate parent.
+	superseded := make(map[hash.Hash]struct{})
+	for _, a := range all {
+		cv, err := d.ReadValue(ctx, a)
+		if err != nil {
+			return nil, err
+		}
+		parents, err := GetCommitParents(ctx, d, cv)
+		if err != nil {
+			return nil, err
+		}
+		for _, p := range parents {
+			superseded[p.Addr()] = struct{}{}
+		}
+	}
+
+	var frontier []hash.Hash
+	for _, a := range all {
+		if _, ok := superseded[a]; !ok {
+			frontier = append(frontier, a)
+		}
+	}
+	sort.Slice(frontier, func(i, j int) bool {
+		return bytes.Compare(frontier[i][:], frontier[j][:]) < 0
+	})
+	return frontier, nil
+}
+
 // TipValue reads the committed value (the stored root value) of a commit tip.
 // It is a small convenience for callers that hold a tip address from Tips and
 // want the value it commits, without reaching for the unexported value reader.

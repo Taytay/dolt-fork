@@ -147,6 +147,24 @@ func MultiheadFolderFrontier(ctx context.Context, sharedDir string) ([]manifestC
 	return mr.Roots(ctx)
 }
 
+// MultiheadFolderRootHashes returns the Noms root hash of every frontier record
+// in a shared folder — one whole-store root per un-superseded `roots/` record.
+// manifestContents is unexported, so this is the accessor a higher layer (the
+// datas frontier bridge) uses to load each root's dataset AddressMap and read
+// the per-ref tips it carries. The order matches MultiheadFolderFrontier (sorted
+// by store root), so it is stable and coordination-free.
+func MultiheadFolderRootHashes(ctx context.Context, sharedDir string) ([]hash.Hash, error) {
+	frontier, err := MultiheadFolderFrontier(ctx, sharedDir)
+	if err != nil {
+		return nil, err
+	}
+	roots := make([]hash.Hash, 0, len(frontier))
+	for _, c := range frontier {
+		roots = append(roots, c.root)
+	}
+	return roots, nil
+}
+
 // MaterializeFrontierManifest compacts the shared folder's frontier into a
 // single ordinary nbs manifest: it writes a `manifest` file whose specs are the
 // UNION of every frontier head's table specs, so a plain NomsBlockStore opened
