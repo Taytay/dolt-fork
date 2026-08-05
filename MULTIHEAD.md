@@ -201,6 +201,9 @@ multi-head mode Dolt-wide, keeping stock behavior byte-identical when unset:
 - `libraries/doltcore/doltdb/doltdb.go` — `(*DoltDB).MultiheadTips(ref)` exposes
   the frontier; `libraries/doltcore/sqle/dfunctions/frontier.go` —
   `dolt_frontier()` SQL function surfaces the current branch's tips.
+  `dolt_frontier('<ref>')` takes an optional ref argument, so a remote-tracking
+  ref's frontier is inspectable after a fetch —
+  `dolt_frontier('refs/remotes/origin/main')`.
 
 Verified end-to-end against a freshly built `dolt` binary: `DOLT_MULTIHEAD=1
 dolt init / sql / add / commit / log / status / branch` all work; a commit
@@ -210,13 +213,46 @@ fast-forward. Tests: `store/datas` unit tests for resolve-mode reads
 (`TestMultiheadCommitWithWorkingSet`, incl. a stale-head fork with no
 `ErrMergeNeeded`).
 
-**Known limits of the toggle (the honest edges).** Producing a *fork* on one ref
-through two concurrent `dolt` CLIs on one folder still needs the multi-head
-fetch/push path (push is still fast-forward-checked) or bypassing the journaling
-store's exclusive lock — that's the next work. Working-set concurrency, `dolt
-merge` of the frontier, conflict tables, refspec/push, and GC are not yet
-frontier-aware. The toggle makes the write *model* multi-head and reads
-fork-tolerant; it is experimental.
+**Multi-head fetch/push — two CLIs sharing a folder remote fork and reconcile.**
+The follow-on that removes the toggle's last "known limit": with multi-head push
+a *divergent* push FORKS the remote instead of being rejected as non-fast-forward,
+and fetch brings the whole frontier home. Because `DOLT_MULTIHEAD` opens a
+`file://` remote multi-head through the same `LoadDoltDBWithParams` hook, two
+writers sharing one folder remote each land a head.
+
+- `libraries/doltcore/doltdb/doltdb.go` — `(*DoltDB).RecordTip(ref, addr)` (the
+  multi-head analogue of `SetHeadToCommit`/`FastForward`: append a tip, no CAS,
+  no fast-forward gate) and `(*DoltDB).IsMultihead()`.
+- `libraries/doltcore/env/actions/multihead_remotes.go` — `pushMultihead` and
+  `fetchRefSpecsMultihead`. Push transfers the commit's chunk closure (unchanged
+  `PullChunks`, content-addressed) then records it as a tip on the remote and on
+  the local tracking ref — no fast-forward gate. Fetch pulls EVERY tip of each
+  remote ref's frontier (`MultiheadTips`) and records them all on the tracking
+  ref, so the other writer's fork becomes visible locally. The stock single-root
+  path in `remotes.go` is untouched; these run only when the relevant
+  `IsMultihead()` is true (branch points in `actions.Push` and
+  `fetchRefSpecsWithDepth`). Chunk transfer is head-agnostic and reused as-is;
+  only the ref-update discipline (a frontier of tips vs. one CAS'd head) differs.
+- Tests: `libraries/doltcore/env/actions/multihead_remotes_test.go`
+  (`TestPushMultihead_DivergentPushForks`: two children of one base pushed in turn
+  leave the remote with a two-tip frontier, a child push collapses it, and a third
+  writer's fetch mechanics bring the whole fork home) and
+  `integration-tests/bats/multihead-remotes.bats` (the CLI story). Verified
+  end-to-end against a built `dolt` binary: writer B's divergent `dolt push`
+  succeeds where stock prints "non-fast-forward / integrate the remote changes
+  before pushing again", and after `dolt fetch` writer A sees both tips in
+  `dolt_frontier('refs/remotes/origin/main')`.
+
+**Known limits (the honest edges).** Push/fetch are now frontier-aware, so two
+`dolt` CLIs sharing a folder remote fork and each keep a head. What is still NOT
+frontier-aware: `dolt pull`'s *merge* half and `dolt merge` (reconciling the
+fetched frontier into the local branch through the CLI — the engine exists,
+`merge.MergeRoots` / `store/datas.MergeTips`, but is not yet wired to consume a
+tracking-ref frontier), conflict tables, working-set concurrency, and GC. Tags
+are still single-headed on the wire. Truly *simultaneous* pushes to one folder
+serialize at the remote's nbs root-map (both survive as tips, none rejected); the
+fully lock-free deposit is the `store/nbs` `roots/` path (`PublishHeadTo`), not
+yet wired under push. The toggle remains experimental.
 
 ### Build & test
 ```bash
@@ -229,6 +265,10 @@ go test ./store/datas/ -count=1                                           # Step
 go test ./store/datas/ -run 'TestMultiheadDatasets|TestReconcile|TestMultiheadPrimary|TestMultihead_SharedFolder' -count=1 -v  # 15
 # SQL/relational tier (needs libicu-dev for the cgo icu-regex dep):
 go test ./libraries/doltcore/merge/ -run TestMultiheadReconcile -count=1 -v  # 3
+# Multi-head fetch/push (needs libicu-dev):
+go test ./libraries/doltcore/env/actions/ -run TestPushMultihead -count=1 -v  # divergent push forks; fetch brings the frontier
+# CLI story (needs the bats harness + a built dolt on PATH):
+#   integration-tests/bats/multihead-remotes.bats
 ```
 First build downloads the module deps (~1.5 GB, ~1–2 min). Go 1.24. The Go
 module root is `go/`. (The full `./store/nbs/` suite is heavy and can be killed

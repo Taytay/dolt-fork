@@ -15,6 +15,7 @@
 package dfunctions
 
 import (
+	"fmt"
 	"strings"
 
 	"github.com/dolthub/go-mysql-server/sql"
@@ -26,17 +27,29 @@ import (
 
 const DoltFrontierFuncName = "dolt_frontier"
 
-// DoltFrontierFunc returns the multi-head frontier of the current branch as a
-// comma-separated list of commit tip hashes: empty for a normal (single-head)
-// branch, one hash when writers agree, several when there is an unresolved fork
-// to reconcile. It is meaningful only when the database was opened in multi-head
-// mode (DOLT_MULTIHEAD); on a stock single-root database it returns the empty
-// string. It is the SQL surface over (*doltdb.DoltDB).MultiheadTips.
-type DoltFrontierFunc struct{}
+// DoltFrontierFunc returns the multi-head frontier of a ref as a comma-separated
+// list of commit tip hashes: empty for a normal (single-head) branch, one hash
+// when writers agree, several when there is an unresolved fork to reconcile.
+//
+// With no argument it reports the current branch's frontier. With one string
+// argument it reports that ref's frontier — e.g.
+// dolt_frontier('refs/remotes/origin/main') to inspect what a `dolt fetch`
+// brought in from a multi-head remote.
+//
+// It is meaningful only when the database was opened in multi-head mode
+// (DOLT_MULTIHEAD); on a stock single-root database it returns the empty string.
+// It is the SQL surface over (*doltdb.DoltDB).MultiheadTips.
+type DoltFrontierFunc struct {
+	children []sql.Expression
+}
 
-// NewDoltFrontierFunc creates a new DoltFrontierFunc expression.
-func NewDoltFrontierFunc(ctx *sql.Context) sql.Expression {
-	return &DoltFrontierFunc{}
+// NewDoltFrontierFunc creates a new DoltFrontierFunc expression accepting an
+// optional single ref argument.
+func NewDoltFrontierFunc(ctx *sql.Context, args ...sql.Expression) (sql.Expression, error) {
+	if len(args) > 1 {
+		return nil, sql.ErrInvalidArgumentNumber.New(DoltFrontierFuncName, "0 or 1", len(args))
+	}
+	return &DoltFrontierFunc{children: args}, nil
 }
 
 // Eval implements the Expression interface.
@@ -52,15 +65,32 @@ func (f *DoltFrontierFunc) Eval(ctx *sql.Context, row sql.Row) (interface{}, err
 		return nil, nil
 	}
 
-	branchRef, err := dSess.CWBHeadRef(ctx, dbName)
-	if err == doltdb.ErrOperationNotSupportedInDetachedHead {
-		return nil, nil
-	}
-	if err != nil {
-		return nil, err
+	var refStr string
+	if len(f.children) == 1 {
+		v, err := f.children[0].Eval(ctx, row)
+		if err != nil {
+			return nil, err
+		}
+		if v == nil {
+			return nil, nil
+		}
+		s, ok := v.(string)
+		if !ok {
+			return nil, fmt.Errorf("%s: ref argument must be a string, got %T", DoltFrontierFuncName, v)
+		}
+		refStr = s
+	} else {
+		branchRef, err := dSess.CWBHeadRef(ctx, dbName)
+		if err == doltdb.ErrOperationNotSupportedInDetachedHead {
+			return nil, nil
+		}
+		if err != nil {
+			return nil, err
+		}
+		refStr = branchRef.String()
 	}
 
-	tips, err := ddb.MultiheadTips(ctx, branchRef.String())
+	tips, err := ddb.MultiheadTips(ctx, refStr)
 	if err != nil {
 		return nil, err
 	}
@@ -73,24 +103,33 @@ func (f *DoltFrontierFunc) Eval(ctx *sql.Context, row sql.Row) (interface{}, err
 }
 
 // String implements the Stringer interface.
-func (f *DoltFrontierFunc) String() string { return "DOLT_FRONTIER()" }
+func (f *DoltFrontierFunc) String() string {
+	if len(f.children) == 1 {
+		return fmt.Sprintf("DOLT_FRONTIER(%s)", f.children[0])
+	}
+	return "DOLT_FRONTIER()"
+}
 
 // IsNullable implements the Expression interface.
 func (f *DoltFrontierFunc) IsNullable(ctx *sql.Context) bool { return false }
 
 // Resolved implements the Expression interface.
-func (*DoltFrontierFunc) Resolved() bool { return true }
+func (f *DoltFrontierFunc) Resolved() bool {
+	for _, c := range f.children {
+		if !c.Resolved() {
+			return false
+		}
+	}
+	return true
+}
 
 // Type implements the Expression interface.
 func (f *DoltFrontierFunc) Type(ctx *sql.Context) sql.Type { return types.Text }
 
 // Children implements the Expression interface.
-func (*DoltFrontierFunc) Children() []sql.Expression { return nil }
+func (f *DoltFrontierFunc) Children() []sql.Expression { return f.children }
 
 // WithChildren implements the Expression interface.
 func (f *DoltFrontierFunc) WithChildren(ctx *sql.Context, children ...sql.Expression) (sql.Expression, error) {
-	if len(children) != 0 {
-		return nil, sql.ErrInvalidChildrenNumber.New(f, len(children), 0)
-	}
-	return NewDoltFrontierFunc(ctx), nil
+	return NewDoltFrontierFunc(ctx, children...)
 }

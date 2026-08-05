@@ -390,6 +390,28 @@ func (ddb *DoltDB) MultiheadTips(ctx context.Context, refStr string) ([]hash.Has
 	return datas.Tips(ctx, ddb.db.Database, refStr)
 }
 
+// IsMultihead reports whether this database was opened in multi-head mode
+// (DOLT_MULTIHEAD). When true, a ref holds a frontier of tips rather than a
+// single CAS'd head, and the multi-head fetch/push path (RecordTip +
+// MultiheadTips) applies instead of the single-root fast-forward discipline.
+func (ddb *DoltDB) IsMultihead() bool {
+	return datas.IsMultiheadResolve(ddb.db.Database)
+}
+
+// RecordTip records |commitAddr| as a tip of |refStr| without a fast-forward or
+// lineage gate: a divergent commit adds a head to the ref's frontier rather than
+// being rejected. It is append-only and idempotent (the key is the commit hash).
+// This is the multi-head analogue of SetHeadToCommit/FastForward and is the ref
+// update used by the multi-head fetch/push path. Meaningful only in multi-head
+// mode; the underlying commit chunks must already be present in this store (push
+// and fetch call PullChunks first).
+func (ddb *DoltDB) RecordTip(ctx context.Context, refStr string, commitAddr hash.Hash) error {
+	if err := datas.ValidateDatasetId(refStr); err != nil {
+		return fmt.Errorf("invalid ref format: %s", refStr)
+	}
+	return datas.RecordTip(ctx, ddb.db.Database, refStr, commitAddr)
+}
+
 // GetHashForRefStr resolves a ref string (such as a branch name or tag) and resolves it to a hash.Hash.
 func (ddb *DoltDB) GetHashForRefStr(ctx context.Context, ref string) (*hash.Hash, error) {
 	if err := datas.ValidateDatasetId(ref); err != nil {

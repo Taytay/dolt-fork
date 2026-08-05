@@ -52,6 +52,14 @@ var ErrShallowPushImpossible = errors.New("shallow repository missing chunks to 
 // destination db to the given commit via fast forward move.  If that succeeds the tracking branch is updated in the
 // source db.
 func Push(ctx context.Context, tempTableDir string, mode ref.UpdateMode, destRef ref.BranchRef, remoteRef ref.RemoteRef, srcDB, destDB *doltdb.DoltDB, commit *doltdb.Commit, statsCh chan pull.Stats) error {
+	// Multi-head push: publish the commit as a tip of the remote ref with no
+	// fast-forward gate, so a divergent push forks the remote instead of being
+	// rejected. See multihead_remotes.go. The stock single-root path below is
+	// untouched.
+	if destDB.IsMultihead() {
+		return pushMultihead(ctx, tempTableDir, destRef, remoteRef, srcDB, destDB, commit, statsCh)
+	}
+
 	var err error
 	if mode == ref.FastForwardOnly {
 		canFF, err := destDB.CanFastForward(ctx, destRef, commit)
@@ -495,6 +503,14 @@ func fetchRefSpecsWithDepth[C doltdb.Context](
 	depth int,
 	statsCh chan pull.Stats,
 ) error {
+	// Multi-head fetch: pull every tip of each remote ref's frontier and record
+	// them all on the local tracking ref, so a fork on the remote becomes visible
+	// locally. Shallow (depth-limited) fetch keeps the stock single-head path.
+	// See multihead_remotes.go.
+	if srcDB.IsMultihead() && depth <= 0 {
+		return fetchRefSpecsMultihead(ctx, dbData, srcDB, refSpecs, defaultRefSpecs, remote, mode, statsCh)
+	}
+
 	var branchRefs []doltdb.RefWithHash
 	err := srcDB.VisitRefsOfType(ctx, ref.HeadRefTypes, func(r ref.DoltRef, addr hash.Hash) error {
 		branchRefs = append(branchRefs, doltdb.RefWithHash{Ref: r, Hash: addr})
