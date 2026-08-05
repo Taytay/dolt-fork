@@ -88,6 +88,61 @@ seed_and_push_base() {
     [[ "${lines[1]}" =~ ^[0-9a-v]{32}$ ]] || false
 }
 
+@test "multihead-remotes: reconcile collapses a fetched fork into one merged head" {
+    export DOLT_MULTIHEAD=1
+
+    seed_and_push_base
+
+    # A second writer clones, commits divergently, and pushes (forks the remote).
+    mkdir clones
+    cd clones
+    dolt clone file://../remotedir b
+    cd b
+    dolt sql -q "insert into t values (20, 20)"
+    dolt commit -am "B: add row 20"
+    dolt push origin main
+    cd ../..
+
+    # Writer A commits and pushes its own side, then fetches the fork.
+    dolt sql -q "insert into t values (10, 10)"
+    dolt commit -am "A: add row 10"
+    dolt push origin main
+    dolt fetch origin
+
+    # Reconcile the fetched multi-head remote into main.
+    run dolt sql -q "call dolt_reconcile('refs/remotes/origin/main')"
+    [ "$status" -eq 0 ]
+
+    # main is now a single head again.
+    run dolt sql -q "select dolt_frontier() as f" -r csv
+    [ "$status" -eq 0 ]
+    [[ "${lines[1]}" =~ ^[0-9a-v]{32}$ ]] || false
+
+    # The merged head carries BOTH writers' rows.
+    run dolt sql -q "select id from t order by id" -r csv
+    [ "$status" -eq 0 ]
+    [[ "$output" =~ "1" ]] || false
+    [[ "$output" =~ "10" ]] || false
+    [[ "$output" =~ "20" ]] || false
+
+    # It is a real merge commit (two parents).
+    run dolt log -n 1 --parents
+    [ "$status" -eq 0 ]
+    [[ "$output" =~ "Merge:" ]] || false
+}
+
+@test "multihead-remotes: reconcile is a no-op on a single-head branch" {
+    export DOLT_MULTIHEAD=1
+    dolt sql -q "create table t (id int primary key, v int)"
+    dolt sql -q "insert into t values (1, 1)"
+    dolt add .
+    dolt commit -m "base"
+
+    run dolt sql -q "call dolt_reconcile()" -r csv
+    [ "$status" -eq 0 ]
+    [[ "$output" =~ "nothing to reconcile" ]] || false
+}
+
 @test "multihead-remotes: stock mode still rejects a non-fast-forward push" {
     # No DOLT_MULTIHEAD: the single-root fast-forward discipline is unchanged.
     seed_and_push_base

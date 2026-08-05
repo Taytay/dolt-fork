@@ -243,16 +243,51 @@ writers sharing one folder remote each land a head.
   before pushing again", and after `dolt fetch` writer A sees both tips in
   `dolt_frontier('refs/remotes/origin/main')`.
 
-**Known limits (the honest edges).** Push/fetch are now frontier-aware, so two
-`dolt` CLIs sharing a folder remote fork and each keep a head. What is still NOT
-frontier-aware: `dolt pull`'s *merge* half and `dolt merge` (reconciling the
-fetched frontier into the local branch through the CLI — the engine exists,
-`merge.MergeRoots` / `store/datas.MergeTips`, but is not yet wired to consume a
-tracking-ref frontier), conflict tables, working-set concurrency, and GC. Tags
-are still single-headed on the wire. Truly *simultaneous* pushes to one folder
-serialize at the remote's nbs root-map (both survive as tips, none rejected); the
-fully lock-free deposit is the `store/nbs` `roots/` path (`PublishHeadTo`), not
-yet wired under push. The toggle remains experimental.
+**Frontier-aware reconcile — collapse a fork into one head through the CLI.**
+The other half of the round trip: after push/fetch produce a fork,
+`dolt_reconcile()` three-way merges the frontier back into a single head with the
+same engine `dolt merge` uses.
+
+- `libraries/doltcore/merge/multihead_reconcile.go` — `ReconcileFrontier(ctx,
+  ddb, branchRef, meta, eo)`: reads the ref's frontier (`MultiheadTips`), folds
+  the tips through the real `merge.MergeRoots` (base = each tip's common ancestor,
+  `GetCommitAncestor`), writes the merged `RootValue`, and records ONE commit
+  naming every tip as a parent — so `datas.Tips` drops them and the frontier
+  collapses to that single merged head. It reports conflict/violation counts; a
+  conflicted reconcile still collapses (the conflicts are recorded in the merged
+  commit, resolvable with `dolt conflicts` / `dolt_conflicts_resolve`). Lives in
+  the `merge` package because it calls `MergeRoots` (which imports `doltdb`).
+- `libraries/doltcore/sqle/dprocedures/dolt_reconcile.go` — the `dolt_reconcile()`
+  stored procedure (the frontier analogue of `dolt merge`, callable as
+  `dolt sql -q "call dolt_reconcile()"`). It reconciles the current branch's
+  frontier and syncs the working set to the merged root. With an optional ref
+  argument — `dolt_reconcile('refs/remotes/origin/main')` — it first folds that
+  ref's frontier onto the current branch (via `RecordTip`), then reconciles: the
+  "merge a fetched multi-head remote into my branch" flow. Returns
+  `(hash, tips, conflicts, message)`.
+- Tests: `libraries/doltcore/merge/multihead_reconcile_frontier_test.go`
+  (`TestReconcileFrontier_DisjointCollapsesToOneHead` — a real forked branch
+  collapses to one merged head with two parents, and a re-run is a no-op;
+  `TestReconcileFrontier_ConflictRecordedStillCollapses` — a same-row conflict is
+  recorded and the fork still collapses) and the reconcile cases in
+  `integration-tests/bats/multihead-remotes.bats`. Verified end-to-end against a
+  built `dolt` binary: two writers fork a folder remote, `dolt fetch` brings the
+  fork, `call dolt_reconcile('refs/remotes/origin/main')` collapses `main` to one
+  head whose rows are the union of both writers' edits and whose `dolt log` shows
+  a two-parent merge commit; a conflicting fork collapses with `dolt_conflicts`
+  populated (base/ours/theirs) for resolution.
+
+**Known limits (the honest edges).** Push/fetch and reconcile are frontier-aware,
+so the full round trip — two `dolt` CLIs fork a folder remote, then
+`dolt_reconcile()` collapses the fork to one merged head — works from the CLI.
+What is still NOT wired: reconcile is a dedicated `dolt_reconcile()` procedure,
+not `dolt merge <branch>` / `dolt pull` themselves (those keep the stock
+single-root path); `dolt_reconcile` folds >2 tips against the canonical tip's
+ancestor (octopus-style approximation — a true two-writer fork is exact); GC is
+not frontier-aware; tags are single-headed on the wire. Truly *simultaneous*
+pushes to one folder serialize at the remote's nbs root-map (both survive as
+tips, none rejected); the fully lock-free deposit is the `store/nbs` `roots/`
+path (`PublishHeadTo`), not yet wired under push. The toggle remains experimental.
 
 ### Build & test
 ```bash
@@ -267,8 +302,10 @@ go test ./store/datas/ -run 'TestMultiheadDatasets|TestReconcile|TestMultiheadPr
 go test ./libraries/doltcore/merge/ -run TestMultiheadReconcile -count=1 -v  # 3
 # Multi-head fetch/push (needs libicu-dev):
 go test ./libraries/doltcore/env/actions/ -run TestPushMultihead -count=1 -v  # divergent push forks; fetch brings the frontier
+# Frontier-aware reconcile (needs libicu-dev):
+go test ./libraries/doltcore/merge/ -run TestReconcileFrontier -count=1 -v  # fork collapses to one merged head; conflict still collapses
 # CLI story (needs the bats harness + a built dolt on PATH):
-#   integration-tests/bats/multihead-remotes.bats
+#   integration-tests/bats/multihead-remotes.bats  (push/fetch fork + dolt_reconcile round trip)
 ```
 First build downloads the module deps (~1.5 GB, ~1–2 min). Go 1.24. The Go
 module root is `go/`. (The full `./store/nbs/` suite is heavy and can be killed
