@@ -182,6 +182,42 @@ writers, shows the sticky head, and reconciles with Dolt's real three-way merge
 into a single head. This is "multiwriter versioned Dolt in a local folder,"
 runnable today via the store API.
 
+**CLI/SQL toggle — `DOLT_MULTIHEAD=1`.** An env var opens databases in
+multi-head mode Dolt-wide, keeping stock behavior byte-identical when unset:
+
+- `libraries/doltcore/dconfig/envvars.go` — `EnvMultihead = "DOLT_MULTIHEAD"`.
+- `libraries/doltcore/doltdb/doltdb.go` — `LoadDoltDBWithParams` (and
+  `DoltDBFromCS`) call `datas.EnableMultiheadResolve(db)` when the env var is
+  set. This is the load path for on-disk/remote databases, so it covers the
+  whole CLI/SQL stack from one place.
+- `store/datas/multihead_primary.go` — `EnableMultiheadResolve` turns on
+  **fork-tolerant reads**: `GetDataset` resolves a fork to the canonical
+  (lowest-hash) head instead of `ErrMultipleHeads`, and `Datasets`/
+  `DatasetsByRootHash` present each ref once (a `multiheadDatasetsMap` collapses
+  the internal tip sub-keys so branch/tag enumeration never sees them). The CLI
+  write path `CommitWithWorkingSet` gets a multi-head branch
+  (`commitWithWorkingSetMultihead`) that records the commit as a tip (no head
+  CAS) while updating the working set atomically.
+- `libraries/doltcore/doltdb/doltdb.go` — `(*DoltDB).MultiheadTips(ref)` exposes
+  the frontier; `libraries/doltcore/sqle/dfunctions/frontier.go` —
+  `dolt_frontier()` SQL function surfaces the current branch's tips.
+
+Verified end-to-end against a freshly built `dolt` binary: `DOLT_MULTIHEAD=1
+dolt init / sql / add / commit / log / status / branch` all work; a commit
+records a frontier tip (`select dolt_frontier()` shows it); sequential commits
+fast-forward. Tests: `store/datas` unit tests for resolve-mode reads
+(`TestMultiheadResolve_*`), the collapsing enumeration, and the CLI write path
+(`TestMultiheadCommitWithWorkingSet`, incl. a stale-head fork with no
+`ErrMergeNeeded`).
+
+**Known limits of the toggle (the honest edges).** Producing a *fork* on one ref
+through two concurrent `dolt` CLIs on one folder still needs the multi-head
+fetch/push path (push is still fast-forward-checked) or bypassing the journaling
+store's exclusive lock — that's the next work. Working-set concurrency, `dolt
+merge` of the frontier, conflict tables, refspec/push, and GC are not yet
+frontier-aware. The toggle makes the write *model* multi-head and reads
+fork-tolerant; it is experimental.
+
 ### Build & test
 ```bash
 cd go

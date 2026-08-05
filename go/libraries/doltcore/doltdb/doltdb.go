@@ -29,6 +29,7 @@ import (
 	"github.com/sirupsen/logrus"
 
 	"github.com/dolthub/dolt/go/libraries/doltcore/dbfactory"
+	"github.com/dolthub/dolt/go/libraries/doltcore/dconfig"
 	"github.com/dolthub/dolt/go/libraries/doltcore/ref"
 	"github.com/dolthub/dolt/go/libraries/utils/earl"
 	dherrors "github.com/dolthub/dolt/go/libraries/utils/errors"
@@ -149,6 +150,15 @@ func DoltDBFromCS(cs chunks.ChunkStore, databaseName string) (*DoltDB, error) {
 	vrw := types.NewValueStore(cs)
 	ns := tree.NewNodeStore(cs)
 	db := datas.NewTypesDatabase(vrw, ns)
+	// Experimental CAS-free multi-head mode (DOLT_MULTIHEAD): a divergent commit
+	// adds a head instead of being rejected, and reads resolve a fork to a
+	// canonical head (the full frontier is available via dolt_frontier()). Off
+	// by default, so stock behavior is unchanged unless the env var is set.
+	if os.Getenv(dconfig.EnvMultihead) != "" {
+		if err := datas.EnableMultiheadResolve(db); err != nil {
+			return nil, err
+		}
+	}
 	commitCache, err := lru.New[hash.Hash, *OptionalCommit](commitCacheSize)
 	if err != nil {
 		return nil, err
@@ -217,6 +227,15 @@ func LoadDoltDBWithParams(ctx context.Context, nbf *types.NomsBinFormat, urlStr 
 	db, vrw, ns, err := dbfactory.CreateDB(ctx, nbf, urlStr, params)
 	if err != nil {
 		return nil, err
+	}
+
+	// Experimental CAS-free multi-head mode (DOLT_MULTIHEAD). This is the load
+	// path for on-disk and remote databases (dbfactory.CreateDB), so hooking it
+	// here covers the CLI/SQL stack. Off by default; see EnableMultiheadResolve.
+	if os.Getenv(dconfig.EnvMultihead) != "" {
+		if err := datas.EnableMultiheadResolve(db); err != nil {
+			return nil, err
+		}
 	}
 
 	commitCache, err := lru.New[hash.Hash, *OptionalCommit](commitCacheSize)
@@ -355,6 +374,20 @@ func (ddb *DoltDB) Close() error {
 
 func (ddb *DoltDB) Teardown(ctx context.Context) error {
 	return datas.ChunkStoreFromDatabase(ddb.db).Teardown(ctx)
+}
+
+// MultiheadTips returns the multi-head frontier of |refStr|: the set of commit
+// tips that ref currently has (one when writers agree; several when there is an
+// unresolved fork). It is meaningful only when the database was opened in
+// multi-head mode (DOLT_MULTIHEAD); a single-root database returns at most one
+// tip. This is the programmatic surface behind the dolt_frontier() SQL function.
+func (ddb *DoltDB) MultiheadTips(ctx context.Context, refStr string) ([]hash.Hash, error) {
+	if err := datas.ValidateDatasetId(refStr); err != nil {
+		return nil, fmt.Errorf("invalid ref format: %s", refStr)
+	}
+	// Unwrap the hooksDatabase to the underlying datas.Database (Tips type-
+	// asserts to the concrete *database).
+	return datas.Tips(ctx, ddb.db.Database, refStr)
 }
 
 // GetHashForRefStr resolves a ref string (such as a branch name or tag) and resolves it to a hash.Hash.

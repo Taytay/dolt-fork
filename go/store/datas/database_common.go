@@ -47,6 +47,13 @@ type database struct {
 	// in multi-head mode (MULTIHEAD.md Step 2c; invariant #4). See
 	// multihead_primary.go.
 	multihead bool
+	// multiheadResolveHead, when set (implies multihead), makes GetDataset
+	// resolve a forked ref to a single canonical head instead of returning
+	// ErrMultipleHeads, and makes Datasets present each ref once (collapsing the
+	// internal tip sub-keys) resolved to that head. This is what lets ordinary
+	// readers — the CLI/SQL stack — proceed on a fork; the full set is still
+	// available via Tips. See EnableMultiheadResolve in multihead_primary.go.
+	multiheadResolveHead bool
 }
 
 var (
@@ -140,6 +147,13 @@ func (db *database) Datasets(ctx context.Context) (DatasetsMap, error) {
 	if err != nil {
 		return nil, err
 	}
+	if db.multihead {
+		// Present each ref once, collapsing the internal tip sub-keys to a
+		// single resolved head, so enumerators (branch/tag listing) never see
+		// the multi-tip encoding. See multiheadDatasetsMap in
+		// multihead_primary.go.
+		return multiheadDatasetsMap{db: db, am: rm}, nil
+	}
 	return refmapDatasetsMap{rm}, nil
 }
 
@@ -177,6 +191,11 @@ func (db *database) DatasetsByRootHash(ctx context.Context, rootHash hash.Hash) 
 	rm, err := db.loadDatasetsRefmap(ctx, rootHash)
 	if err != nil {
 		return nil, err
+	}
+	if db.multihead {
+		// Collapse tip sub-keys so enumeration at a specific root never leaks
+		// the multi-tip encoding (mirrors Datasets).
+		return multiheadDatasetsMap{db: db, am: rm}, nil
 	}
 	return refmapDatasetsMap{rm}, nil
 }
@@ -761,6 +780,12 @@ func (db *database) CommitWithWorkingSet(
 	val types.Value, workingSetSpec WorkingSetSpec,
 	prevWsHash hash.Hash, opts CommitOptions,
 ) (Dataset, Dataset, error) {
+	if db.multihead {
+		// Primary multi-head path: record the commit as a tip (no lineage gate,
+		// no head CAS) while still updating the working set atomically. This is
+		// the write path the CLI/SQL stack uses. See multihead_primary.go.
+		return db.commitWithWorkingSetMultihead(ctx, commitDS, workingSetDS, val, workingSetSpec, prevWsHash, opts)
+	}
 	wsAddr, err := newWorkingSet(ctx, db, workingSetSpec)
 	if err != nil {
 		return Dataset{}, Dataset{}, err
