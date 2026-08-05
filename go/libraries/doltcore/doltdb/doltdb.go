@@ -412,6 +412,20 @@ func (ddb *DoltDB) RecordTip(ctx context.Context, refStr string, commitAddr hash
 	return datas.RecordTip(ctx, ddb.db.Database, refStr, commitAddr)
 }
 
+// MultiheadFrontierTips returns every ref's multi-head frontier keyed by ref
+// string: the live tips that Datasets would collapse away when a ref is forked.
+// It is the garbage collector's supplement to Datasets — GC must keep every
+// frontier tip as a root so a not-yet-reconciled fork's history is not
+// collected. Refs with only a single (bare) head are omitted; GC picks those up
+// from Datasets. Meaningful only in multi-head mode; a single-root database
+// returns an empty map.
+func (ddb *DoltDB) MultiheadFrontierTips(ctx context.Context) (map[string][]hash.Hash, error) {
+	if !ddb.IsMultihead() {
+		return nil, nil
+	}
+	return datas.AllFrontierTips(ctx, ddb.db.Database)
+}
+
 // GetHashForRefStr resolves a ref string (such as a branch name or tag) and resolves it to a hash.Hash.
 func (ddb *DoltDB) GetHashForRefStr(ctx context.Context, ref string) (*hash.Hash, error) {
 	if err := datas.ValidateDatasetId(ref); err != nil {
@@ -2051,7 +2065,7 @@ func (ddb *DoltDB) GC(ctx context.Context, gcConfig chunks.GCConfig, safepointCo
 
 	newGen := make(hash.HashSet)
 	oldGen := make(hash.HashSet)
-	err = datasets.IterAll(ctx, func(keyStr string, h hash.Hash) error {
+	insertRoot := func(keyStr string, h hash.Hash) error {
 		var isOldGen bool
 		switch {
 		case ref.IsRef(keyStr):
@@ -2071,10 +2085,38 @@ func (ddb *DoltDB) GC(ctx context.Context, gcConfig chunks.GCConfig, safepointCo
 		}
 
 		return nil
-	})
-
+	}
+	err = datasets.IterAll(ctx, insertRoot)
 	if err != nil {
 		return err
+	}
+
+	// In multi-head mode a forked ref holds a frontier of tips, but Datasets
+	// collapses each ref to its one canonical (lowest-hash) tip — so the other
+	// tips of a fork are NOT enumerated above. Add every frontier tip as a root
+	// in the same generation as an ordinary branch head.
+	//
+	// This does not, by itself, keep a fork from being collected: the underlying
+	// store already roots the raw manifest address map (see ValueStore.GC), and
+	// that map holds every tip as a content-addressed sub-key, so a divergent
+	// tip is reachable and retained regardless. What this adds is correct
+	// GENERATIONAL placement — a fork's non-canonical tips are classified with
+	// the other branch heads (old generation) instead of being reachable only
+	// through the manifest root and thus treated as new-generation data that is
+	// re-walked on every GC. It also makes the "a live fork is a GC root"
+	// invariant explicit here rather than an implicit consequence of a deep nbs
+	// detail, so it survives future changes to how roots are gathered. Same-
+	// address inserts are idempotent (the sets are keyed by hash).
+	frontiers, err := ddb.MultiheadFrontierTips(ctx)
+	if err != nil {
+		return err
+	}
+	for refStr, tips := range frontiers {
+		for _, h := range tips {
+			if err := insertRoot(refStr, h); err != nil {
+				return err
+			}
+		}
 	}
 
 	return collector.GC(ctx, gcConfig, oldGen, newGen, safepointController)

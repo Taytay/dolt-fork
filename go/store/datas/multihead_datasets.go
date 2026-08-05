@@ -144,6 +144,57 @@ func (db *database) recordTip(ctx context.Context, ref string, commitAddr hash.H
 	})
 }
 
+// AllFrontierTips returns, for every ref that has multi-head tips recorded, the
+// ref's frontier (the tips no other tip of that ref names as an immediate
+// parent). Refs that carry only a bare single-root head — no tip sub-keys — are
+// omitted, since Datasets already enumerates those normally.
+//
+// This is the garbage collector's view of the live multi-head heads: Datasets
+// collapses a forked ref to its one canonical (lowest-hash) tip, so the OTHER
+// tips of a fork are invisible to a reader that walks Datasets. GC must keep
+// every frontier tip as a root, or a divergent fork's unique history would be
+// collected out from under a not-yet-reconciled branch. A superseded (non-
+// frontier) tip is an ancestor of some frontier tip, so keeping the frontier
+// keeps the whole recorded DAG by reachability.
+func AllFrontierTips(ctx context.Context, db Database) (map[string][]hash.Hash, error) {
+	d, err := asDatabase(db)
+	if err != nil {
+		return nil, err
+	}
+	rootHash, err := d.rt.Root(ctx)
+	if err != nil {
+		return nil, err
+	}
+	am, err := d.loadDatasetsRefmap(ctx, rootHash)
+	if err != nil {
+		return nil, err
+	}
+
+	// One pass to find which refs have tip sub-keys at all.
+	refs := make(map[string]struct{})
+	err = am.IterAll(ctx, func(key string, _ hash.Hash) error {
+		if i := strings.Index(key, tipKeyInfix); i >= 0 {
+			refs[key[:i]] = struct{}{}
+		}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	out := make(map[string][]hash.Hash, len(refs))
+	for ref := range refs {
+		frontier, err := d.frontierOf(ctx, am, ref)
+		if err != nil {
+			return nil, err
+		}
+		if len(frontier) > 0 {
+			out[ref] = frontier
+		}
+	}
+	return out, nil
+}
+
 // TipValue reads the committed value (the stored root value) of a commit tip.
 // It is a small convenience for callers that hold a tip address from Tips and
 // want the value it commits, without reaching for the unexported value reader.

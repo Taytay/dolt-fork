@@ -49,6 +49,7 @@ var doltSubCommands = []cli.Command{
 	commands.BranchCmd{},
 	commands.CheckoutCmd{},
 	commands.MergeCmd{},
+	commands.ReconcileCmd{},
 	cnfcmds.Commands,
 	commands.CherryPickCmd{},
 	commands.RevertCmd{},

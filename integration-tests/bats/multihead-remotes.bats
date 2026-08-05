@@ -131,6 +131,83 @@ seed_and_push_base() {
     [[ "$output" =~ "Merge:" ]] || false
 }
 
+@test "multihead-remotes: dolt reconcile CLI subcommand collapses a fetched fork" {
+    export DOLT_MULTIHEAD=1
+
+    seed_and_push_base
+
+    mkdir clones
+    cd clones
+    dolt clone file://../remotedir b
+    cd b
+    dolt sql -q "insert into t values (20, 20)"
+    dolt commit -am "B: add row 20"
+    dolt push origin main
+    cd ../..
+
+    dolt sql -q "insert into t values (10, 10)"
+    dolt commit -am "A: add row 10"
+    dolt push origin main
+    dolt fetch origin
+
+    # The first-class CLI verb (no `call dolt_reconcile(...)`).
+    run dolt reconcile refs/remotes/origin/main
+    [ "$status" -eq 0 ]
+    [[ "$output" =~ "Reconciled 2 heads" ]] || false
+
+    # main collapsed to a single merged head carrying both writers' rows.
+    run dolt sql -q "select dolt_frontier() as f" -r csv
+    [ "$status" -eq 0 ]
+    [[ "${lines[1]}" =~ ^[0-9a-v]{32}$ ]] || false
+    run dolt sql -q "select id from t order by id" -r csv
+    [[ "$output" =~ "10" ]] || false
+    [[ "$output" =~ "20" ]] || false
+
+    # A second reconcile is a no-op.
+    run dolt reconcile
+    [ "$status" -eq 0 ]
+    [[ "$output" =~ "nothing to reconcile" ]] || false
+}
+
+@test "multihead-remotes: gc keeps a fork's whole frontier" {
+    export DOLT_MULTIHEAD=1
+
+    seed_and_push_base
+
+    mkdir clones
+    cd clones
+    dolt clone file://../remotedir b
+    cd b
+    dolt sql -q "insert into t values (20, 20)"
+    dolt commit -am "B: add row 20"
+    dolt push origin main
+    cd ../..
+
+    dolt sql -q "insert into t values (10, 10)"
+    dolt commit -am "A: add row 10"
+    dolt push origin main
+    dolt fetch origin
+
+    # The tracking ref is forked (two tips) before GC.
+    run dolt sql -q "select dolt_frontier('refs/remotes/origin/main') as f" -r csv
+    [[ "${lines[1]}" =~ ^[0-9a-v]{32},[0-9a-v]{32}$ ]] || false
+
+    # GC must not collect either tip of the live fork.
+    run dolt gc
+    [ "$status" -eq 0 ]
+
+    run dolt sql -q "select dolt_frontier('refs/remotes/origin/main') as f" -r csv
+    [ "$status" -eq 0 ]
+    [[ "${lines[1]}" =~ ^[0-9a-v]{32},[0-9a-v]{32}$ ]] || false
+
+    # And the fork still reconciles cleanly into the merged rows after GC.
+    run dolt reconcile refs/remotes/origin/main
+    [ "$status" -eq 0 ]
+    run dolt sql -q "select id from t order by id" -r csv
+    [[ "$output" =~ "10" ]] || false
+    [[ "$output" =~ "20" ]] || false
+}
+
 @test "multihead-remotes: reconcile is a no-op on a single-head branch" {
     export DOLT_MULTIHEAD=1
     dolt sql -q "create table t (id int primary key, v int)"
