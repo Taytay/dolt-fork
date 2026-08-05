@@ -162,6 +162,26 @@ shared folder at once with no lock and no CAS:
   path Dolt-wide (every reader taught to expect a frontier) — the store seam is
   now here (`PublishHeadTo` + `MultiheadFolderFrontier`).
 
+**Choosing a working head without merging (no flip-flop).** A reader often wants
+one head to proceed on while the fork is unresolved. `store/datas/multihead_head.go`:
+
+- `ResolveHead(ctx, db, ref, preferred)` — **sticky**: if the caller's current
+  head is still a tip it is kept (it does not move just because another writer's
+  tip appeared — the flip-flop hazard); only once it is superseded does it fall
+  back to the canonical tip. `forked` reports "unmerged work exists." A fresh
+  reader (empty `preferred`) gets `CanonicalTip` — the lowest-hash tip, which
+  every reader agrees on with no coordination. Neither pick merges or drops a
+  tip, and neither supersedes by time (invariant #2). `Tips` remains the truth.
+- `multihead_head_test.go` — proves a writer's head stays put as other tips
+  arrive, and falls back only after its head is merged away.
+
+**Runnable end-to-end demo.** `go run ./store/datas/multihead_demo [folder]` — a
+real program (real store, real merge) that (A) fires N writers into one folder
+simultaneously and shows all N heads survive, then (B) forks a table across two
+writers, shows the sticky head, and reconciles with Dolt's real three-way merge
+into a single head. This is "multiwriter versioned Dolt in a local folder,"
+runnable today via the store API.
+
 ### Build & test
 ```bash
 cd go

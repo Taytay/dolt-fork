@@ -230,5 +230,12 @@ func (m *multiheadRoots) Roots(ctx context.Context) ([]manifestContents, error) 
 		seenRoot[r.contents.root] = struct{}{}
 		tips = append(tips, r.contents)
 	}
+	// Sort by store root for a stable, coordination-free order: every reader of
+	// the same frontier computes the same sequence (and so the same canonical
+	// tips[0]) without any shared state. Map iteration above is unordered, so
+	// this sort is what makes the frontier deterministic.
+	sort.Slice(tips, func(i, j int) bool {
+		return bytes.Compare(tips[i].root[:], tips[j].root[:]) < 0
+	})
 	return tips, nil
 }
