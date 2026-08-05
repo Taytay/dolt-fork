@@ -358,22 +358,48 @@ the append-only `roots/` layer:
   unions the per-ref frontier across the roots, three-way merges it with Dolt's
   real engine, and a merged deposit collapses the frontier to one head.
 
-*What still remains before `dolt push file://<synced-folder>` is lock-free
-end-to-end* (the honest, sequenced next steps):
-1. **Chunk-closure → table-file persister, not a copy.** `PublishHeadTo` copies
-   *existing* table files, but a local repo journals its chunks
-   (`doltdb.go` sets `ChunkJournalParam`), so journaled chunks aren't loose table
-   files to copy. Push must write the pushed commit's chunk closure into the
-   shared folder as a content-addressed table file directly.
-2. **Generational reach.** A `file://` remote is a `GenerationalNBS` (newGen =
-   classic `LocalStore`, oldGen under `oldgen/`); the deposit path must target
-   the right generation rather than assume a bare `*NomsBlockStore`.
-3. **Lazy-sync-safe read materialization.** Fetch currently would call
-   `MaterializeFrontierManifest`, which writes a `manifest` into the shared
-   folder; on a synced folder a reader should materialize into a local scratch
-   instead so no shared file is written on read either.
-4. **Wire it under `pushMultihead`/`fetchRefSpecsMultihead`** for `file://`
-   folder remotes, folded into `DOLT_MULTIHEAD` (the chosen toggle).
+*Wired under `dolt push`/`dolt fetch` (folded into `DOLT_MULTIHEAD`).* A
+multi-head push to a `file://` folder now records the head authoritatively in
+`roots/`, and fetch reconstructs the frontier from `roots/` — so a lost or
+lazy-sync-mangled manifest cannot lose a head. The realization was simpler than
+the original plan because a `file://` remote's newGen is a classic table-file
+`LocalStore` (not a journaling store): `RecordTip`'s commit already flushes the
+pushed closure to content-addressed table files in the folder, so no separate
+closure→table-file persister was needed after all.
+
+- `doltdb.DoltDB.DepositFolderFrontierRecord` /
+  `nbs.NomsBlockStore.RecordFrontierHead` — append the store's current head as an
+  append-only `roots/` record IN PLACE (no table-file copy; the chunks are
+  already present). This replaced the copy-based `PublishHeadTo` on the push
+  path, which mis-handled archive (`.darc`) table files whose on-disk name
+  carries a suffix the bare spec name does not.
+- `pushMultihead` (`env/actions/multihead_remotes.go`) — after the existing
+  `PullChunks` + `RecordTip` (which flush table files and best-effort advance the
+  manifest), it appends the authoritative `roots/` record with `parents=nil`
+  (the true frontier is recovered from commit parents, so an un-parented record
+  only lingers).
+- `fetchRefSpecsMultihead` — first `MaterializeFolderFrontier` (a READ-side
+  compaction that rebuilds a readable union manifest from `roots/` and rebases
+  onto it — deterministic and non-authoritative), then reads each ref's tips with
+  `RefFrontierAcrossFolderRoots` across the whole `roots/` set rather than
+  trusting the manifest.
+- Tests: `env/actions/multihead_remotes_test.go`
+  (`TestPushMultihead_FolderRootsAreAuthoritative` — two divergent pushes fork
+  the remote, the manifest is deleted, and a fresh handle still recovers the
+  two-tip frontier from `roots/`) and the `roots/ deposit survives a lost
+  manifest (lazy-sync safe)` case in `multihead-remotes.bats`. Verified
+  end-to-end against a built `dolt`: fork a folder remote, `rm remotedir/manifest`
+  (modelling a conflict-copy loss), then `dolt fetch` + `dolt reconcile` still
+  recover and collapse the fork to `{1,10,20}`.
+
+*Remaining refinements (correctness holds without them).* `roots/` records are
+never pruned, so a long-lived remote accumulates one record per push (read cost
+grows; a compaction that rewrites `roots/` after a reconcile is future work). If
+a remote is GC'd so a head's closure spans the `oldgen/` directory, a record's
+newGen-relative specs may not cover it — untested; the common append-only shared
+folder is not GC'd. Truly *simultaneous* pushes' manifest advances still race
+(best-effort), but the `roots/` deposit that follows is what makes the outcome
+correct regardless.
 
 **Other known limits (the honest edges).** Push/fetch, reconcile, and GC are all
 frontier-aware, so the full round trip — two `dolt` CLIs fork a folder remote,
@@ -383,11 +409,10 @@ fork intact — works from the CLI on a local/NFS remote. `dolt merge <branch>` 
 `dolt reconcile` verb / `dolt_reconcile()` procedure, deliberately not entangled
 with the heavily-used merge path); `dolt_reconcile` folds >2 tips against the
 canonical tip's ancestor (octopus-style approximation — a true two-writer fork is
-exact); tags are single-headed on the wire. Truly *simultaneous* pushes to a
-local/NFS folder serialize at the remote's nbs manifest CAS (both survive as
-tips, none rejected); the fully lock-free, no-manifest deposit is the `roots/`
-bridge above — proven at the store/datas tier, with the CLI wiring sequenced in
-the four steps above. The toggle remains experimental.
+exact); tags are single-headed on the wire. The `roots/`-authoritative push/fetch
+above is what makes a lazily-synced folder a safe remote — a lost manifest cannot
+lose a head; the manifest advance during push is best-effort and never relied
+upon. The toggle remains experimental.
 
 ### Build & test
 ```bash
@@ -402,7 +427,7 @@ go test ./store/datas/ -run TestMultihead_FolderBridgeNoManifestOverwrite -count
 # SQL/relational tier (needs libicu-dev for the cgo icu-regex dep):
 go test ./libraries/doltcore/merge/ -run TestMultiheadReconcile -count=1 -v  # 3
 # Multi-head fetch/push (needs libicu-dev):
-go test ./libraries/doltcore/env/actions/ -run TestPushMultihead -count=1 -v  # divergent push forks; fetch brings the frontier
+go test ./libraries/doltcore/env/actions/ -run TestPushMultihead -count=1 -v  # divergent push forks; fetch brings the frontier; roots/ survives a lost manifest
 # Frontier-aware reconcile (needs libicu-dev):
 go test ./libraries/doltcore/merge/ -run TestReconcileFrontier -count=1 -v  # fork collapses to one merged head; conflict still collapses
 # Frontier-aware GC (needs libicu-dev):

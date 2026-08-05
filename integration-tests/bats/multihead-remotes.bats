@@ -220,6 +220,47 @@ seed_and_push_base() {
     [[ "$output" =~ "nothing to reconcile" ]] || false
 }
 
+@test "multihead-remotes: roots/ deposit survives a lost manifest (lazy-sync safe)" {
+    export DOLT_MULTIHEAD=1
+
+    seed_and_push_base
+
+    mkdir clones
+    cd clones
+    dolt clone file://../remotedir b
+    cd b
+    dolt sql -q "insert into t values (20, 20)"
+    dolt commit -am "B: add row 20"
+    dolt push origin main
+    cd ../..
+
+    dolt sql -q "insert into t values (10, 10)"
+    dolt commit -am "A: add row 10"
+    dolt push origin main
+
+    # Each push deposited an append-only roots/ record on the remote.
+    [ -d remotedir/roots ] || false
+    [ "$(ls remotedir/roots | wc -l)" -ge 3 ] || false
+
+    # LAZY-SYNC SIMULATION: the mutable manifest is lost, as a Dropbox/Drive
+    # conflict-copy of two concurrent writers' manifests would lose it.
+    rm -f remotedir/manifest
+
+    # Fetch still reconstructs the WHOLE fork from roots/ (the authority).
+    run dolt fetch origin
+    [ "$status" -eq 0 ]
+    run dolt sql -q "select dolt_frontier('refs/remotes/origin/main') as f" -r csv
+    [ "$status" -eq 0 ]
+    [[ "${lines[1]}" =~ ^[0-9a-v]{32},[0-9a-v]{32}$ ]] || false
+
+    # And the recovered fork still reconciles cleanly into both writers' rows.
+    run dolt reconcile refs/remotes/origin/main
+    [ "$status" -eq 0 ]
+    run dolt sql -q "select id from t order by id" -r csv
+    [[ "$output" =~ "10" ]] || false
+    [[ "$output" =~ "20" ]] || false
+}
+
 @test "multihead-remotes: stock mode still rejects a non-fast-forward push" {
     # No DOLT_MULTIHEAD: the single-root fast-forward discipline is unchanged.
     seed_and_push_base

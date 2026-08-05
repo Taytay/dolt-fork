@@ -83,7 +83,25 @@ func pushMultihead(
 	// than being rejected (the whole point of multi-head push). A sequential
 	// push names the previous tip as a parent, so the remote's frontier collapses
 	// back to one head.
+	//
+	// On a local folder remote this advances the manifest with an optimistic CAS,
+	// which a lazily-synced folder (Dropbox/Drive) would mangle under concurrent
+	// writers. RecordTip also flushes the pushed closure and the new dataset
+	// address map to content-addressed TABLE FILES in the folder, which is what
+	// the authoritative deposit below then references.
 	if err = destDB.RecordTip(ctx, destRef.String(), h); err != nil {
+		return err
+	}
+
+	// Authoritatively record the head in the append-only, content-addressed
+	// `roots/` set. This is the head a fetch trusts; the manifest advance above
+	// is a best-effort cache. Because the record is write-once and never
+	// overwritten, two writers sharing a synced folder each land a record and no
+	// head is lost even when their manifest advances collide. parents=nil is
+	// safe: RefFrontierAcrossFolderRoots recovers the true frontier from commit
+	// parents, so an un-parented record only lingers. A non-folder remote returns
+	// ok=false and keeps the stock (manifest-only) behavior.
+	if _, _, err = destDB.DepositFolderFrontierRecord(ctx, nil); err != nil {
 		return err
 	}
 
@@ -109,8 +127,18 @@ func fetchRefSpecsMultihead[C doltdb.Context](
 	mode ref.UpdateMode,
 	statsCh chan pull.Stats,
 ) error {
+	// On a shared folder remote the authoritative multi-head state is the
+	// append-only `roots/` set, not the (possibly stale or lazy-sync-mangled)
+	// manifest. Materialize the folder frontier into a readable union manifest
+	// first, so branch enumeration and the per-ref frontier below see every
+	// writer's deposited head rather than whatever the manifest happens to hold.
+	folderRoots, isFolder, err := materializeFolderFrontier(ctx, srcDB)
+	if err != nil {
+		return err
+	}
+
 	var branchRefs []doltdb.RefWithHash
-	err := srcDB.VisitRefsOfType(ctx, ref.HeadRefTypes, func(r ref.DoltRef, addr hash.Hash) error {
+	err = srcDB.VisitRefsOfType(ctx, ref.HeadRefTypes, func(r ref.DoltRef, addr hash.Hash) error {
 		branchRefs = append(branchRefs, doltdb.RefWithHash{Ref: r, Hash: addr})
 		return nil
 	})
@@ -155,7 +183,15 @@ func fetchRefSpecsMultihead[C doltdb.Context](
 				continue
 			}
 
-			tips, err := srcDB.MultiheadTips(ctx, branchRef.Ref.String())
+			var tips []hash.Hash
+			if isFolder {
+				// Authoritative frontier: union the ref's tips across every
+				// deposited `roots/` record, so a fork produced by independent
+				// writers on the shared folder is fetched whole.
+				tips, err = srcDB.RefFrontierAcrossFolderRoots(ctx, branchRef.Ref.String(), folderRoots)
+			} else {
+				tips, err = srcDB.MultiheadTips(ctx, branchRef.Ref.String())
+			}
 			if err != nil {
 				return err
 			}
@@ -224,4 +260,25 @@ func fetchRefSpecsMultihead[C doltdb.Context](
 	}
 
 	return nil
+}
+
+// materializeFolderFrontier prepares a shared folder remote for a
+// frontier-authoritative read: it compacts the folder's append-only `roots/` set
+// into a readable union manifest and rebases |srcDB| onto it, returning the
+// frontier's whole-store root hashes. isFolder is false for a remote that is not
+// a local folder with a `roots/` set (a plain single-root remote), in which case
+// the caller reads tips from the manifest via MultiheadTips as before.
+func materializeFolderFrontier(ctx context.Context, srcDB *doltdb.DoltDB) (roots []hash.Hash, isFolder bool, err error) {
+	ok, err := srcDB.MaterializeFolderFrontier(ctx)
+	if err != nil {
+		return nil, false, err
+	}
+	if !ok {
+		return nil, false, nil
+	}
+	roots, _, err = srcDB.FolderFrontierRootHashes(ctx)
+	if err != nil {
+		return nil, false, err
+	}
+	return roots, true, nil
 }

@@ -136,6 +136,34 @@ func copyContentAddressedFile(srcDir, sharedDir, name string) error {
 	return file.Rename(tempName, dst)
 }
 
+// RecordFrontierHead appends this store's current committed head (its whole-store
+// root and table specs) as an append-only, content-addressed `roots/` record IN
+// THIS STORE'S OWN DIRECTORY — no table-file copy, no lock, no manifest
+// overwrite. Use it to publish a head on a store that already IS the shared
+// folder (a file:// remote receiving a push): the chunks are already present as
+// table files, so PublishHeadTo's copy step is both redundant and wrong for
+// archive (.darc) table files, whose on-disk name carries a suffix the bare spec
+// name does not. Reading resolves a spec to its archive transparently, so the
+// record's bare specs stay correct.
+func (nbs *NomsBlockStore) RecordFrontierHead(ctx context.Context, parents []hash.Hash) (hash.Hash, error) {
+	nbs.mu.RLock()
+	contents := nbs.upstream
+	nbs.mu.RUnlock()
+
+	dir, ok, err := nbs.Path(ctx)
+	if err != nil {
+		return hash.Hash{}, err
+	}
+	if !ok {
+		return hash.Hash{}, fmt.Errorf("RecordFrontierHead requires a file-backed store")
+	}
+	mr, err := getMultiheadRoots(dir)
+	if err != nil {
+		return hash.Hash{}, err
+	}
+	return mr.Publish(ctx, contents, parents)
+}
+
 // MultiheadFolderFrontier returns the multi-head frontier of a shared folder:
 // the tips of the `roots/` record DAG, each a (root, specs) pair over the shared
 // table files. One tip means the writers agree; several is a live fork.
