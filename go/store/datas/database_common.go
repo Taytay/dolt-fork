@@ -38,6 +38,22 @@ type database struct {
 	*types.ValueStore
 	rt rootTracker
 	ns tree.NodeStore
+	// multihead, when set, makes this database's PRIMARY commit path
+	// multi-head: Commit publishes a tip with no fast-forward gate and no CAS
+	// on the ref (a divergent commit adds a head instead of ErrMergeNeeded),
+	// and GetDataset resolves the ref's frontier (the sole tip, or
+	// ErrMultipleHeads when forked). It defaults to false so the single-root
+	// path is byte-identical to stock until a database is deliberately opened
+	// in multi-head mode (MULTIHEAD.md Step 2c; invariant #4). See
+	// multihead_primary.go.
+	multihead bool
+	// multiheadResolveHead, when set (implies multihead), makes GetDataset
+	// resolve a forked ref to a single canonical head instead of returning
+	// ErrMultipleHeads, and makes Datasets present each ref once (collapsing the
+	// internal tip sub-keys) resolved to that head. This is what lets ordinary
+	// readers — the CLI/SQL stack — proceed on a fork; the full set is still
+	// available via Tips. See EnableMultiheadResolve in multihead_primary.go.
+	multiheadResolveHead bool
 }
 
 var (
@@ -45,6 +61,11 @@ var (
 	ErrMergeNeeded          = errors.New("dataset head is not ancestor of commit")
 	ErrAlreadyCommitted     = errors.New("dataset head already pointing at given commit")
 	ErrDirtyWorkspace       = errors.New("target has uncommitted changes. --force required to overwrite")
+	// ErrMultipleHeads is returned by the multi-head primary path when a ref
+	// has a live fork (more than one tip) and a caller asks for its single
+	// head. Reconcile the tips (see MergeTips) and record the result to
+	// collapse the frontier. Defined here beside the other datas sentinels.
+	ErrMultipleHeads = errors.New("dataset has multiple heads; reconcile the fork")
 )
 
 // rootTracker is a narrowing of the ChunkStore interface, to keep Database disciplined about working directly with Chunks
@@ -126,6 +147,13 @@ func (db *database) Datasets(ctx context.Context) (DatasetsMap, error) {
 	if err != nil {
 		return nil, err
 	}
+	if db.multihead {
+		// Present each ref once, collapsing the internal tip sub-keys to a
+		// single resolved head, so enumerators (branch/tag listing) never see
+		// the multi-tip encoding. See multiheadDatasetsMap in
+		// multihead_primary.go.
+		return multiheadDatasetsMap{db: db, am: rm}, nil
+	}
 	return refmapDatasetsMap{rm}, nil
 }
 
@@ -164,10 +192,20 @@ func (db *database) DatasetsByRootHash(ctx context.Context, rootHash hash.Hash) 
 	if err != nil {
 		return nil, err
 	}
+	if db.multihead {
+		// Collapse tip sub-keys so enumeration at a specific root never leaks
+		// the multi-tip encoding (mirrors Datasets).
+		return multiheadDatasetsMap{db: db, am: rm}, nil
+	}
 	return refmapDatasetsMap{rm}, nil
 }
 
 func (db *database) datasetFromMap(ctx context.Context, datasetID string, dsmap DatasetsMap) (Dataset, error) {
+	if db.multihead {
+		// Primary multi-head path: resolve the ref's frontier. A single tip is
+		// the head; a fork returns ErrMultipleHeads. See multihead_primary.go.
+		return db.datasetFromFrontier(ctx, datasetID, dsmap)
+	}
 	if rmdsmap, ok := dsmap.(refmapDatasetsMap); ok {
 		var err error
 		curr, err := rmdsmap.am.Get(ctx, datasetID)
@@ -528,6 +566,11 @@ func (db *database) BuildNewCommit(ctx context.Context, ds Dataset, v types.Valu
 }
 
 func (db *database) Commit(ctx context.Context, ds Dataset, v types.Value, opts CommitOptions) (Dataset, error) {
+	if db.multihead {
+		// Primary multi-head path: no lineage gate, no ref CAS — a divergent
+		// commit adds a tip. See commitMultihead in multihead_primary.go.
+		return db.commitMultihead(ctx, ds, v, opts)
+	}
 	commit, err := db.BuildNewCommit(ctx, ds, v, opts)
 	if err != nil {
 		return Dataset{}, err
@@ -737,6 +780,12 @@ func (db *database) CommitWithWorkingSet(
 	val types.Value, workingSetSpec WorkingSetSpec,
 	prevWsHash hash.Hash, opts CommitOptions,
 ) (Dataset, Dataset, error) {
+	if db.multihead {
+		// Primary multi-head path: record the commit as a tip (no lineage gate,
+		// no head CAS) while still updating the working set atomically. This is
+		// the write path the CLI/SQL stack uses. See multihead_primary.go.
+		return db.commitWithWorkingSetMultihead(ctx, commitDS, workingSetDS, val, workingSetSpec, prevWsHash, opts)
+	}
 	wsAddr, err := newWorkingSet(ctx, db, workingSetSpec)
 	if err != nil {
 		return Dataset{}, Dataset{}, err

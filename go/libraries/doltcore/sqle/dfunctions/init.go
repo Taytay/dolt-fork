@@ -27,6 +27,7 @@ var DoltFunctions = []sql.Function{
 	sql.Function1{Name: HashOfTableFuncName, Fn: NewHashOfTable},
 	sql.FunctionN{Name: HashOfDatabaseFuncName, Fn: NewHashOfDatabase},
 	sql.Function1{Name: JoinCostFuncName, Fn: NewJoinCost},
+	sql.FunctionN{Name: DoltFrontierFuncName, Fn: NewDoltFrontierFunc},
 }
 
 // DolthubApiFunctions are the DoltFunctions that get exposed to Dolthub Api.

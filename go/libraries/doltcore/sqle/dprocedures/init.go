@@ -44,6 +44,7 @@ var DoltProcedures = []sql.ExternalStoredProcedureDetails{
 	{Name: "dolt_merge", Schema: doltMergeSchema, Function: doltMerge},
 	{Name: "dolt_pull", Schema: doltPullSchema, Function: doltPull, AdminOnly: true},
 	{Name: "dolt_push", Schema: doltPushSchema, Function: doltPush, AdminOnly: true},
+	{Name: "dolt_reconcile", Schema: doltReconcileSchema, Function: doltReconcile},
 	{Name: "dolt_remote", Schema: int64Schema("status"), Function: doltRemote, AdminOnly: true},
 	{Name: "dolt_reset", Schema: int64Schema("status"), Function: doltReset},
 	{Name: "dolt_revert", Schema: doltRevertSchema, Function: doltRevert},

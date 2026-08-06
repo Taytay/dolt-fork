@@ -29,6 +29,11 @@ const (
 	EnvPushLog                       = "PUSH_LOG"
 	EnvTestForceOpenEditor           = "DOLT_TEST_FORCE_OPEN_EDITOR"
 	EnvDisableChunkJournal           = "DOLT_DISABLE_CHUNK_JOURNAL"
+	// EnvMultihead, when set to a non-empty value, opens databases in CAS-free
+	// multi-head mode: a divergent commit adds a head instead of being rejected
+	// (ErrMergeNeeded), reads resolve a fork to a canonical head, and the full
+	// frontier is available via dolt_frontier(). Experimental; off by default.
+	EnvMultihead                     = "DOLT_MULTIHEAD"
 	EnvDisableReflog                 = "DOLT_DISABLE_REFLOG"
 	EnvReflogRecordLimit             = "DOLT_REFLOG_RECORD_LIMIT"
 	EnvOssEndpoint                   = "OSS_ENDPOINT"
