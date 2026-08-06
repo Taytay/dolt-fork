@@ -435,7 +435,8 @@ go test ./libraries/doltcore/doltdb/ -run 'TestMultiheadGCKeepsFrontier|TestGarb
 # First-class dolt reconcile subcommand builds into the CLI:
 go build -o /tmp/dolt ./cmd/dolt && /tmp/dolt reconcile --help
 # CLI story (needs the bats harness + a built dolt on PATH):
-#   integration-tests/bats/multihead-remotes.bats  (push/fetch fork + dolt reconcile + gc round trip)
+#   integration-tests/bats/multihead-remotes.bats    (push/fetch fork + dolt reconcile + gc + lost-manifest recovery)
+#   integration-tests/bats/multihead-mapreduce.bats  (5 machines generate/uppercase/reduce 500 strings via a shared folder; disjoint = clean, same-key = conflict)
 ```
 First build downloads the module deps (~1.5 GB, ~1–2 min). Go 1.24. The Go
 module root is `go/`. (The full `./store/nbs/` suite is heavy and can be killed
